@@ -1,0 +1,2 @@
+[console_scripts]
+server = debugZero.server.app:main

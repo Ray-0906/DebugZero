@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: openenv-debugZero
+Version: 0.1.0
+Summary: Debugzero environment for OpenEnv
+Requires-Python: >=3.10
+Requires-Dist: datasets>=4.8.4
+Requires-Dist: openenv-core[core]>=0.2.1
+Requires-Dist: pytest>=9.0.3
+Requires-Dist: thefuzz>=0.22.1
+Requires-Dist: transformers>=5.6.2
+Requires-Dist: trl>=1.2.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
