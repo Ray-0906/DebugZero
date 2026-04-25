@@ -354,11 +354,18 @@ def load_training_model_and_tokenizer(
 
     if HAS_UNSLOTH:
         print("Initializing Unsloth FastLanguageModel...")
+        # T4 GPUs (compute capability < 8.0) crash with vLLM's torch.compile,
+        # so we disable fast_inference (vLLM) and fall back to HF generate.
+        import torch as _t
+        use_fast = True
+        if _t.cuda.is_available() and _t.cuda.get_device_capability()[0] < 8:
+            print("T4 GPU detected (CC<8) — disabling vLLM fast_inference to avoid torch.compile crash")
+            use_fast = False
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=DEFAULT_MODEL_ID,
             max_seq_length=DEFAULT_MAX_PROMPT_LENGTH + DEFAULT_MAX_COMPLETION_LENGTH,
             load_in_4bit=True,
-            fast_inference=True,
+            fast_inference=use_fast,
         )
         model = FastLanguageModel.get_peft_model(
             model,
