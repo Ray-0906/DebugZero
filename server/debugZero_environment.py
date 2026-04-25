@@ -16,15 +16,18 @@ from openenv.core.env_server.interfaces import Environment
 
 try:
     from ..models import DebugzeroAction, DebugzeroObservation, DebugzeroState
-    from ..seed_bank import HUMANEVAL_SEED, SEED_BANK, SeedSpec
 except ImportError:
     from models import DebugzeroAction, DebugzeroObservation, DebugzeroState
-    from seed_bank import HUMANEVAL_SEED, SEED_BANK, SeedSpec
 
 try:
-    from .executor import execute_code
+    from .seed_bank import HUMANEVAL_SEED, SEED_BANK, SeedSpec
 except ImportError:
-    from executor import execute_code
+    from server.seed_bank import HUMANEVAL_SEED, SEED_BANK, SeedSpec
+
+try:
+    from .grader import GradingResult, grade_submission
+except ImportError:
+    from grader import GradingResult, grade_submission
 
 
 class DebugzeroEnvironment(Environment):
@@ -62,38 +65,24 @@ class DebugzeroEnvironment(Environment):
     def step(self, action: DebugzeroAction) -> DebugzeroObservation:  # type: ignore[override]
         self._state.step_count += 1
 
-        tests = self._current_seed.test
-
         if action.role == "proposer":
             self._state.current_code = action.code
-            result = execute_code(self._state.current_code, tests)
+            result = grade_submission(self._state.current_code, self._current_seed)
             self._state.role_turn = "solver"
-
-            return DebugzeroObservation(
+            return self._build_observation(
                 role_next="solver",
-                current_code=self._state.current_code,
-                execution_result=result.output[:500] if result.output else "",
-                tests_passed=result.passed,
-                syntax_error=result.syntax_error,
+                grading=result,
                 done=False,
-                reward=0.0,
-                metadata=self._observation_metadata(),
             )
 
         if action.role == "solver":
             self._state.current_code = action.code
-            result = execute_code(self._state.current_code, tests)
+            result = grade_submission(self._state.current_code, self._current_seed)
             self._state.role_turn = "end"
-
-            return DebugzeroObservation(
+            return self._build_observation(
                 role_next="proposer",
-                current_code=self._state.current_code,
-                execution_result=result.output[:500] if result.output else "",
-                tests_passed=result.passed,
-                syntax_error=result.syntax_error,
+                grading=result,
                 done=True,
-                reward=0.0,
-                metadata=self._observation_metadata(),
             )
 
         return DebugzeroObservation(
@@ -119,6 +108,23 @@ class DebugzeroEnvironment(Environment):
             original_code=seed.original_code,
             current_code=seed.original_code,
             role_turn="proposer",
+        )
+
+    def _build_observation(
+        self,
+        role_next: str,
+        grading: GradingResult,
+        done: bool,
+    ) -> DebugzeroObservation:
+        return DebugzeroObservation(
+            role_next=role_next,
+            current_code=self._state.current_code,
+            execution_result=grading.execution_result,
+            tests_passed=grading.tests_passed,
+            syntax_error=grading.syntax_error,
+            done=done,
+            reward=grading.reward,
+            metadata=self._observation_metadata(),
         )
 
     def _observation_metadata(self) -> dict[str, str]:

@@ -3,16 +3,16 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 
-from seed_bank import SEED_BANK, SeedSpec
-
 try:
+    from .bug_injector import inject_bug
+    from .executor import execute_code
+    from .plausibility import compute_ast_distance
+    from .seed_bank import SEED_BANK, SeedSpec
+except ImportError:
     from server.bug_injector import inject_bug
     from server.executor import execute_code
     from server.plausibility import compute_ast_distance
-except ImportError:
-    from .server.bug_injector import inject_bug
-    from .server.executor import execute_code
-    from .server.plausibility import compute_ast_distance
+    from server.seed_bank import SEED_BANK, SeedSpec
 
 
 V1_BUG_OPERATORS = (
@@ -133,7 +133,9 @@ def _bug_difficulty_score(seed: SeedSpec, sample: BugSample) -> float:
     # Bias toward bugs that preserve the function shape but still require a real local repair.
     local_repair_score = ast_similarity
     execution_signal = min(execution_lines / 4.0, 1.0)
-    return float(operator_score) + local_repair_score + execution_signal
+    raw_score = float(operator_score) + local_repair_score + execution_signal
+    max_score = max(BUG_OPERATOR_PRIORITY.values()) + 2.0
+    return min(0.999, max(0.001, raw_score / max_score))
 
 
 def _count_nonempty_lines(text: str) -> int:

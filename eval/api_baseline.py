@@ -4,18 +4,18 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from bug_bank import build_bug_bank
 from models import DebugzeroAction
-from seed_bank import SEED_BANK, get_seed_by_id
+from server.bug_bank import build_bug_bank
 from server.executor import execute_code
 from server.plausibility import compute_ast_distance
-from training.dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
-from training.rewards import (
+from server.rewards import (
     compute_proposer_reward,
     compute_solver_reward,
     is_effectively_unchanged,
     reset_reward_history,
 )
+from server.seed_bank import SEED_BANK, get_seed_by_id
+from training.dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
 
 
 def extract_python_code(text: str) -> str:

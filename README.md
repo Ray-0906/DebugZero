@@ -16,13 +16,13 @@ The current codebase is not a toy demo. It has a deterministic seed bank, a veri
 
 | File | Role |
 | --- | --- |
-| [seed_bank.py](seed_bank.py) | Curated 6-task seed bank with canonical solutions and tests |
-| [bug_bank.py](bug_bank.py) | Deterministic verified bug generation and train/eval holdout split |
+| [server/seed_bank.py](server/seed_bank.py) | Curated 6-task seed bank with canonical solutions and tests |
+| [server/bug_bank.py](server/bug_bank.py) | Deterministic verified bug generation and train/eval holdout split |
 | [server/debugZero_environment.py](server/debugZero_environment.py) | OpenEnv environment state machine for proposer/solver turns |
 | [server/executor.py](server/executor.py) | Sandboxed subprocess execution for code plus tests |
 | [server/bug_injector.py](server/bug_injector.py) | AST mutation engine for realistic bug injection |
 | [server/plausibility.py](server/plausibility.py) | AST-distance plausibility scoring |
-| [training/rewards.py](training/rewards.py) | Role-aware reward shaping and rolling solve-rate history |
+| [server/rewards.py](server/rewards.py) | Role-aware reward shaping and rolling solve-rate history |
 | [training/dual_role_sampler.py](training/dual_role_sampler.py) | Proposer and solver prompt templates |
 | [training/grpo_train.py](training/grpo_train.py) | Mixed-role GRPO dataset build, eval, and training workflow |
 | [eval/api_baseline.py](eval/api_baseline.py) | Deterministic controls plus live API promise-check harness |
@@ -212,5 +212,5 @@ DebugZero does not execute model-generated code directly in the host process. Th
 ## Notes
 
 - The current task bank is deliberately compact so you can see signal quickly.
-- If you want broader training later, the easiest upgrade is to add more `SeedSpec` entries to [seed_bank.py](seed_bank.py).
+- If you want broader training later, the easiest upgrade is to add more `SeedSpec` entries to [server/seed_bank.py](server/seed_bank.py).
 - Docker and deployment assets are present, but the current workflow is centered on local validation, API probing, and notebook training.

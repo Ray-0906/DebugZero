@@ -5,9 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-FastAPI application for the Debugzero Environment.
+FastAPI application for the __ENV_TITLE_NAME__ Environment.
 
-This module creates an HTTP server that exposes the DebugzeroEnvironment
+This module creates an HTTP server that exposes the __ENV_CLASS_NAME__Environment
 over HTTP and WebSocket endpoints, compatible with EnvClient.
 
 Endpoints:
@@ -27,58 +27,58 @@ Usage:
     # Or run directly:
     python -m server.app
 """
-import os
-
-# Definitively enable the web interface for this deployment
-os.environ["ENABLE_WEB_INTERFACE"] = "true"
 
 try:
     from openenv.core.env_server.http_server import create_app
-except Exception as e:  # pragma: no cover
+except ImportError as e:  # pragma: no cover
     raise ImportError(
         "openenv is required for the web interface. Install dependencies with '\n    uv sync\n'"
     ) from e
 
-if __package__ == "server":
-    from models import DebugzeroAction, DebugzeroObservation
-    from .debugZero_environment import DebugzeroEnvironment
-elif __package__ and __package__.endswith(".server"):
-    from ..models import DebugzeroAction, DebugzeroObservation
-    from .debugZero_environment import DebugzeroEnvironment
-else:
-    from models import DebugzeroAction, DebugzeroObservation
-    from server.debugZero_environment import DebugzeroEnvironment
+try:
+    from ..models import __ENV_CLASS_NAME__Action, __ENV_CLASS_NAME__Observation
+    from .__ENV_NAME___environment import __ENV_CLASS_NAME__Environment
+except ImportError:
+    from models import __ENV_CLASS_NAME__Action, __ENV_CLASS_NAME__Observation
+    from server.__ENV_NAME___environment import __ENV_CLASS_NAME__Environment
 
 
 # Create the app with web interface and README integration
 app = create_app(
-    DebugzeroEnvironment,
-    DebugzeroAction,
-    DebugzeroObservation,
-    env_name="debugZero",
-    max_concurrent_envs=int(os.environ.get("MAX_CONCURRENT_ENVS", "100")),
+    __ENV_CLASS_NAME__Environment,
+    __ENV_CLASS_NAME__Action,
+    __ENV_CLASS_NAME__Observation,
+    env_name="__ENV_NAME__",
+    max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
 )
 
 
-def main():
+def main(host: str = "0.0.0.0", port: int = 8000):
     """
     Entry point for direct execution via uv run or python -m.
 
     This function enables running the server without Docker:
         uv run --project . server
         uv run --project . server --port 8001
-        python -m debugZero.server.app
+        python -m __ENV_NAME__.server.app
+
+    Args:
+        host: Host address to bind to (default: "0.0.0.0")
+        port: Port number to listen on (default: 8000)
+
+    For production deployments, consider using uvicorn directly with
+    multiple workers:
+        uvicorn __ENV_NAME__.server.app:app --workers 4
     """
     import uvicorn
+
+    uvicorn.run(app, host=host, port=port)
+
+
+if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
-    
-    uvicorn.run(app, host=args.host, port=args.port)
-
-
-if __name__ == '__main__':
-    main()
+    main(port=args.port)

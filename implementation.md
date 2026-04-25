@@ -39,8 +39,8 @@ The project is split into a few clear layers.
 
 ### 1. Task and Bug Data
 
-- `seed_bank.py` defines the curated clean tasks
-- `bug_bank.py` builds verified buggy variants from those tasks
+- `server/seed_bank.py` defines the curated clean tasks
+- `server/bug_bank.py` builds verified buggy variants from those tasks
 
 ### 2. Environment Runtime
 
@@ -48,6 +48,7 @@ The project is split into a few clear layers.
 - `server/executor.py` runs generated code safely against tests
 - `server/bug_injector.py` provides AST-based bug mutations
 - `server/plausibility.py` scores whether a proposer bug looks realistic
+- `server/rewards.py` owns proposer and solver reward scoring
 - `server/app.py` exposes the environment through a FastAPI/OpenEnv server
 
 ### 3. Shared Interface
@@ -58,7 +59,6 @@ The project is split into a few clear layers.
 ### 4. Training
 
 - `training/dual_role_sampler.py` builds role-specific prompts
-- `training/rewards.py` computes proposer and solver rewards
 - `training/grpo_train.py` builds the dataset, runs evaluation, and launches GRPO training
 
 ### 5. Evaluation
@@ -223,15 +223,15 @@ This is the main pre-training sanity check.
 
 If we trace one full path through the system, it looks like this:
 
-1. `seed_bank.py` provides a clean seed task.
+1. `server/seed_bank.py` provides a clean seed task.
 2. `server/debugZero_environment.py` resets onto that seed.
 3. A proposer model generates code from a proposer prompt built by `training/dual_role_sampler.py` or `eval/api_baseline.py`.
 4. `server/executor.py` runs the candidate code against the seed tests.
-5. `training/rewards.py` computes proposer reward.
+5. `server/rewards.py` computes proposer reward.
 6. If the proposer created a valid failing bug, the solver gets a repair prompt.
 7. The solver generates repaired code.
 8. `server/executor.py` runs the repair candidate.
-9. `training/rewards.py` computes solver reward.
+9. `server/rewards.py` computes solver reward.
 10. `training/grpo_train.py` uses these rewards during GRPO training or fixed evaluation.
 
 ## Tracked Python Files
@@ -244,11 +244,11 @@ Below is what each currently tracked `.py` file is doing.
 
 Marks the repository root package so imports can work cleanly in package-style execution.
 
-#### [seed_bank.py](./seed_bank.py)
+#### [server/seed_bank.py](./server/seed_bank.py)
 
 Defines the curated seed task bank. Each seed includes the prompt, canonical solution, test harness, and function entrypoint. This is the base dataset for the whole environment.
 
-#### [bug_bank.py](./bug_bank.py)
+#### [server/bug_bank.py](./server/bug_bank.py)
 
 Builds and stores verified buggy samples from the seed bank. It filters mutations down to samples that are syntactically valid, meaningfully changed, safe to run, and test-failing. It also splits them into training and evaluation holdouts.
 
@@ -298,7 +298,7 @@ Builds the role-specific prompts used during training. It formats proposer promp
 
 The main training entrypoint. It builds datasets, prepares the trainer, evaluates before and after training, and saves training artifacts such as the results plot.
 
-#### [training/rewards.py](./training/rewards.py)
+#### [server/rewards.py](./server/rewards.py)
 
 Defines the reward logic for proposer and solver outputs. It is the main source of learning signal for GRPO.
 

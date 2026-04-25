@@ -5,4 +5,6 @@ type: space
 runtime: fastapi
 app: server.app:app
 port: 8000
+workers: 4
+max_concurrent_envs: 100
 
