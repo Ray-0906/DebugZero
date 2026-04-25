@@ -416,6 +416,47 @@ with DebugzeroEnv(base_url="http://localhost:8000") as env:
     print(result.observation.tests_passed)
 ```
 
+## Inference Checker
+
+[`inference.py`](inference.py) is a standalone environment checker for the submitted Space. It runs full DebugZero episodes through the packaged OpenEnv client and logs every step in a compact format.
+
+Run against the Hugging Face Space:
+
+```bash
+set DEBUGZERO_API_URL=https://YOUR-USERNAME-debugzero.hf.space
+set NUM_EPISODES=3
+python inference.py
+```
+
+By default, it uses a deterministic sanity policy that:
+
+1. resets the environment,
+2. submits a known failing proposer mutation,
+3. submits the original clean solution as the solver repair,
+4. verifies that proposer failure and solver success are both detected.
+
+To use an LLM through the Hugging Face router or another OpenAI-compatible endpoint:
+
+```bash
+set DEBUGZERO_API_URL=https://YOUR-USERNAME-debugzero.hf.space
+set API_BASE_URL=https://router.huggingface.co/v1
+set HF_TOKEN=your_token_here
+set MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
+python inference.py
+```
+
+Useful environment variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DEBUGZERO_API_URL` | `https://YOUR-USERNAME-debugzero.hf.space` | Remote OpenEnv Space URL. |
+| `LOCAL_IMAGE_NAME` | unset | Docker image name for local OpenEnv image testing. |
+| `NUM_EPISODES` | `3` | Number of episodes to run. |
+| `MAX_STEPS` | `2` | Max steps per episode. DebugZero is normally proposer then solver. |
+| `API_BASE_URL` | `https://router.huggingface.co/v1` | OpenAI-compatible model endpoint. |
+| `API_KEY` / `HF_TOKEN` | unset | Enables LLM mode when present. |
+| `MODEL_NAME` | `Qwen/Qwen2.5-72B-Instruct` | Chat model used for action generation. |
+
 ## Repository Structure
 
 ```text

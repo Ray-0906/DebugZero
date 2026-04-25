@@ -48,12 +48,38 @@ class ExecutionResult:
         self.syntax_error = syntax_error
         self.timeout_error = timeout_error
 
+def _first_function_name(code: str) -> str | None:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return node.name
+    return None
+
+def _tests_define_check(tests: str) -> bool:
+    try:
+        tree = ast.parse(tests)
+    except SyntaxError:
+        return False
+
+    return any(isinstance(node, ast.FunctionDef) and node.name == "check" for node in tree.body)
+
+def _build_full_code(code: str, tests: str) -> str:
+    full_code = f"{code}\n\n{tests}"
+    candidate_name = _first_function_name(code)
+    if candidate_name and _tests_define_check(tests):
+        full_code = f"{full_code}\n\ncheck({candidate_name})"
+    return full_code
+
 def execute_code(code: str, tests: str, timeout: int = 5) -> ExecutionResult:
     """
     Executes the provided python code alongside its tests in an isolated subprocess.
     Returns the execution results.
     """
-    full_code = f"{code}\n\n{tests}"
+    full_code = _build_full_code(code, tests)
     
     if not is_safe(full_code):
         # We need to distinguish between unsafe imports and actual syntax errors

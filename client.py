@@ -12,7 +12,10 @@ from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-from .models import DebugzeroAction, DebugzeroObservation, DebugzeroState
+try:
+    from .models import DebugzeroAction, DebugzeroObservation, DebugzeroState
+except ImportError:
+    from models import DebugzeroAction, DebugzeroObservation, DebugzeroState
 
 
 class DebugzeroEnv(

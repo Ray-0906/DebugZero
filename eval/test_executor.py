@@ -24,3 +24,16 @@ def test_execute_code():
     res2 = execute_code(code_buggy, tests)
     assert res2.passed == False
     assert res2.syntax_error == False
+
+def test_execute_code_calls_humaneval_check():
+    tests = "def check(candidate):\n    assert candidate(1, 2) == 3"
+
+    good = "def add(a, b): return a + b"
+    good_res = execute_code(good, tests)
+    assert good_res.passed == True
+    assert good_res.syntax_error == False
+
+    buggy = "def add(a, b): return a - b"
+    buggy_res = execute_code(buggy, tests)
+    assert buggy_res.passed == False
+    assert buggy_res.syntax_error == False
