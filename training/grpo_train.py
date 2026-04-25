@@ -432,16 +432,18 @@ def get_trl_classes():
     return GRPOConfig, GRPOTrainer
 
 
-def create_trainer(model, tokenizer, dataset: Dataset, dry_run: bool):
+def create_trainer(model, tokenizer, dataset: Dataset, dry_run: bool, max_steps_override: int | None = None):
     GRPOConfig, GRPOTrainer = get_trl_classes()
     profile = get_training_profile(dry_run)
+
+    max_steps = max_steps_override if max_steps_override is not None else profile["max_steps"]
 
     training_args = GRPOConfig(
         output_dir=str(DEFAULT_OUTPUT_DIR),
         per_device_train_batch_size=profile["per_device_train_batch_size"],
         gradient_accumulation_steps=profile["gradient_accumulation_steps"],
         learning_rate=profile["learning_rate"],
-        max_steps=profile["max_steps"],
+        max_steps=max_steps,
         num_generations=profile["num_generations"],
         max_completion_length=profile["max_completion_length"],
         bf16=(not dry_run) and HAS_UNSLOTH and is_bfloat16_supported(),
