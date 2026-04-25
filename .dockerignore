@@ -1,0 +1,16 @@
+.git
+.gitignore
+.venv
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.claude/
+.codex/
+graphify-out/
+debugzero_model/
+notebooks/
+build/
+dist/

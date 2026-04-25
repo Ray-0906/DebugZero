@@ -24,12 +24,9 @@ RUN apt-get update && \
 ARG BUILD_MODE=in-repo
 ARG ENV_NAME=debugZero
 
-# Copy environment code (always at root of build context)
-COPY . /app/env
-
-# For in-repo builds, openenv is already vendored in the build context
-# For standalone builds, openenv will be installed via pyproject.toml
-WORKDIR /app/env
+# Install the server runtime dependencies separately so the image doesn't
+# pull the full training stack from the repo root project.
+COPY server/requirements.txt /app/server-requirements.txt
 
 # Ensure uv is available (for local builds where base image lacks it)
 RUN if ! command -v uv >/dev/null 2>&1; then \
@@ -37,22 +34,13 @@ RUN if ! command -v uv >/dev/null 2>&1; then \
         mv /root/.local/bin/uv /usr/local/bin/uv && \
         mv /root/.local/bin/uvx /usr/local/bin/uvx; \
     fi
-    
-# Install dependencies using uv sync
-# If uv.lock exists, use it; otherwise resolve on the fly
-RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ -f uv.lock ]; then \
-        uv sync --frozen --no-install-project --no-editable; \
-    else \
-        uv sync --no-install-project --no-editable; \
-    fi
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ -f uv.lock ]; then \
-        uv sync --frozen --no-editable; \
-    else \
-        uv sync --no-editable; \
-    fi
+    uv venv /app/.venv && \
+    uv pip install --python /app/.venv/bin/python -r /app/server-requirements.txt
+
+# Copy environment code after dependency installation to preserve the cache
+COPY . /app/env
 
 # Final runtime stage
 FROM ${BASE_IMAGE}
@@ -60,7 +48,7 @@ FROM ${BASE_IMAGE}
 WORKDIR /app
 
 # Copy the virtual environment from builder
-COPY --from=builder /app/env/.venv /app/.venv
+COPY --from=builder /app/.venv /app/.venv
 
 # Copy the environment code
 COPY --from=builder /app/env /app/env

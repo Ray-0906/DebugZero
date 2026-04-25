@@ -36,27 +36,27 @@ try:
     from seed_bank import SEED_BANK, SeedSpec, get_seed_by_id
     from server.bug_injector import infer_bug_operator
     from server.executor import execute_code
-    from server.plausibility import compute_ast_distance
-    from training.dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
-    from training.rewards import (
+    from server.graders import (
+        compute_ast_distance,
         compute_proposer_reward,
         compute_solver_reward,
         is_effectively_unchanged,
         reset_reward_history,
     )
+    from training.dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
 except ImportError:
     from ..bug_bank import BugBank, BugSample, build_bug_bank
     from ..seed_bank import SEED_BANK, SeedSpec, get_seed_by_id
     from ..server.bug_injector import infer_bug_operator
     from ..server.executor import execute_code
-    from ..server.plausibility import compute_ast_distance
-    from .dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
-    from .rewards import (
+    from ..server.graders import (
+        compute_ast_distance,
         compute_proposer_reward,
         compute_solver_reward,
         is_effectively_unchanged,
         reset_reward_history,
     )
+    from .dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
 
 
 DEFAULT_MODEL_ID = "unsloth/Qwen2.5-Coder-3B-Instruct"

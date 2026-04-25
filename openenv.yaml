@@ -1,8 +1,9 @@
 spec_version: 1
 name: debugZero
-description: "Our environment extends the Absolute Zero paradigm (Zhao et al., NeurIPS 2025) to adversarial bug-fixing self-play. The Proposer's mutation operators are implemented from scratch using Python AST manipulation across 8 operator types. The verifier adapts Mutahunter's execution pipeline."
+description: "Our environment DebugZero is adversarial bug-fixing self-play. The Proposer's mutation operators are implemented from scratch using Python AST manipulation across 8 operator types. The verifier adapts Mutahunter's execution pipeline."
 type: space
 runtime: fastapi
 app: server.app:app
 port: 8000
-
+workers: 4
+max_concurrent_envs: 100

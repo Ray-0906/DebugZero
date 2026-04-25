@@ -8,11 +8,11 @@ from seed_bank import SEED_BANK, SeedSpec
 try:
     from server.bug_injector import inject_bug
     from server.executor import execute_code
-    from server.plausibility import compute_ast_distance
+    from server.graders import compute_ast_distance
 except ImportError:
     from .server.bug_injector import inject_bug
     from .server.executor import execute_code
-    from .server.plausibility import compute_ast_distance
+    from .server.graders import compute_ast_distance
 
 
 V1_BUG_OPERATORS = (

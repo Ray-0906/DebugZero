@@ -42,7 +42,7 @@ except Exception as e:  # pragma: no cover
 try:
     from ..models import DebugzeroAction, DebugzeroObservation
     from .debugZero_environment import DebugzeroEnvironment
-except ModuleNotFoundError:
+except ImportError:
     from models import DebugzeroAction, DebugzeroObservation
     from server.debugZero_environment import DebugzeroEnvironment
 
