@@ -1,0 +1,28 @@
+# Build
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.git/
+.gitignore
+
+# Env
+.env
+.env.*
+
+# Logs
+*.log
+eval_*.txt
+
+# Docs
+Build_process/
+README.md
+implementation_plan.md
+task.md
+walkthrough.md
+validate-submission.sh
+verify_deployment.py
+AGENTS.md
+/graphify-out
+.agents
+.codex

@@ -1,0 +1,28 @@
+# Build
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest*
+
+# Env
+.env
+.env.*
+
+# Logs
+*.log
+eval_*.txt
+
+# Docs
+Build_process/
+
+implementation_plan.md
+task.md
+walkthrough.md
+validate-submission.sh
+verify_deployment.py
+AGENTS.md
+/graphify-out
+.agents
+.codex
+chunk1.json

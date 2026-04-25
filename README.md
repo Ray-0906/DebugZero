@@ -1,3 +1,12 @@
+---
+title: DebugZero
+emoji: 🧪
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
+
 # DebugZero Environment
 
 *Our environment extends the Absolute Zero paradigm (Zhao et al., NeurIPS 2025) to adversarial bug-fixing self-play. The Proposer's mutation operators are implemented from scratch using Python AST manipulation across 8 operator types. The verifier adapts Mutahunter's execution pipeline.*
@@ -22,6 +31,12 @@ We provide a direct implementation of the Hugging Face TRL GRPOTrainer, modified
 ```bash
 python training/grpo_train.py
 ```
+
+For the hackathon submission, use the rerunnable Colab notebook at
+[`notebooks/train_colab.ipynb`](notebooks/train_colab.ipynb). It installs DebugZero
+from GitHub, connects through the packaged OpenEnv client, trains with TRL/Unsloth
+against live `reset`/`step` environment rollouts, and saves reward/loss plots for
+the README.
 
 ## Repository Structure
 
