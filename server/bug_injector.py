@@ -190,3 +190,123 @@ def inject_bug(original_code: str, proposed_operator: str) -> tuple[str, bool]:
         return original_code, False
         
     return mutated_code, True
+
+
+def infer_bug_operator(original_code: str, candidate_code: str) -> str | None:
+    try:
+        original_tree = ast.parse(original_code)
+        candidate_tree = ast.parse(candidate_code)
+    except SyntaxError:
+        return None
+
+    if ast.dump(original_tree) == ast.dump(candidate_tree):
+        return None
+
+    original_nodes = list(ast.walk(original_tree))
+    candidate_nodes = list(ast.walk(candidate_tree))
+
+    inferred = (
+        _infer_wrong_builtin(original_nodes, candidate_nodes)
+        or _infer_loop_boundary_shift(original_nodes, candidate_nodes)
+        or _infer_slice_boundary_corruption(original_nodes, candidate_nodes)
+        or _infer_condition_negation(original_nodes, candidate_nodes)
+        or _infer_wrong_operator(original_nodes, candidate_nodes)
+        or _infer_off_by_one(original_nodes, candidate_nodes)
+    )
+    return inferred
+
+
+def _infer_wrong_builtin(original_nodes: list[ast.AST], candidate_nodes: list[ast.AST]) -> str | None:
+    for original_node, candidate_node in zip(original_nodes, candidate_nodes):
+        if not isinstance(original_node, ast.Call) or not isinstance(candidate_node, ast.Call):
+            continue
+        if not isinstance(original_node.func, ast.Name) or not isinstance(candidate_node.func, ast.Name):
+            continue
+        expected = BUILTIN_PAIRS.get(original_node.func.id)
+        if expected and candidate_node.func.id == expected:
+            return "wrong_builtin"
+    return None
+
+
+def _infer_loop_boundary_shift(
+    original_nodes: list[ast.AST],
+    candidate_nodes: list[ast.AST],
+) -> str | None:
+    for original_node, candidate_node in zip(original_nodes, candidate_nodes):
+        if not isinstance(original_node, ast.Call) or not isinstance(candidate_node, ast.Call):
+            continue
+        if not isinstance(original_node.func, ast.Name) or original_node.func.id != "range":
+            continue
+        if not isinstance(candidate_node.func, ast.Name) or candidate_node.func.id != "range":
+            continue
+        if len(original_node.args) != len(candidate_node.args):
+            continue
+        for original_arg, candidate_arg in zip(original_node.args, candidate_node.args):
+            if _is_shifted_by_one(original_arg, candidate_arg):
+                return "loop_boundary_shift"
+    return None
+
+
+def _infer_slice_boundary_corruption(
+    original_nodes: list[ast.AST],
+    candidate_nodes: list[ast.AST],
+) -> str | None:
+    for original_node, candidate_node in zip(original_nodes, candidate_nodes):
+        if not isinstance(original_node, ast.Slice) or not isinstance(candidate_node, ast.Slice):
+            continue
+        if original_node.lower is not None and candidate_node.lower is not None:
+            if _is_shifted_by_one(original_node.lower, candidate_node.lower):
+                return "slice_boundary_corruption"
+        if original_node.upper is not None and candidate_node.upper is not None:
+            if _is_shifted_by_one(original_node.upper, candidate_node.upper):
+                return "slice_boundary_corruption"
+    return None
+
+
+def _infer_condition_negation(
+    original_nodes: list[ast.AST],
+    candidate_nodes: list[ast.AST],
+) -> str | None:
+    for original_node, candidate_node in zip(original_nodes, candidate_nodes):
+        if not isinstance(original_node, ast.If) or not isinstance(candidate_node, ast.If):
+            continue
+        if (
+            isinstance(candidate_node.test, ast.UnaryOp)
+            and isinstance(candidate_node.test.op, ast.Not)
+            and ast.dump(candidate_node.test.operand) == ast.dump(original_node.test)
+        ):
+            return "condition_negation"
+    return None
+
+
+def _infer_wrong_operator(original_nodes: list[ast.AST], candidate_nodes: list[ast.AST]) -> str | None:
+    for original_node, candidate_node in zip(original_nodes, candidate_nodes):
+        if isinstance(original_node, ast.Compare) and isinstance(candidate_node, ast.Compare):
+            if original_node.ops and candidate_node.ops and type(original_node.ops[0]) is not type(candidate_node.ops[0]):
+                return "wrong_operator"
+        if isinstance(original_node, ast.BinOp) and isinstance(candidate_node, ast.BinOp):
+            if type(original_node.op) is not type(candidate_node.op):
+                return "wrong_operator"
+    return None
+
+
+def _infer_off_by_one(original_nodes: list[ast.AST], candidate_nodes: list[ast.AST]) -> str | None:
+    for original_node, candidate_node in zip(original_nodes, candidate_nodes):
+        if not isinstance(original_node, ast.Constant) or not isinstance(candidate_node, ast.Constant):
+            continue
+        if isinstance(original_node.value, bool) or isinstance(candidate_node.value, bool):
+            continue
+        if isinstance(original_node.value, int) and isinstance(candidate_node.value, int):
+            if abs(candidate_node.value - original_node.value) == 1:
+                return "off_by_one"
+    return None
+
+
+def _is_shifted_by_one(original_node: ast.AST, candidate_node: ast.AST) -> bool:
+    if not isinstance(candidate_node, ast.BinOp):
+        return False
+    if ast.dump(candidate_node.left) != ast.dump(original_node):
+        return False
+    if not isinstance(candidate_node.right, ast.Constant) or candidate_node.right.value != 1:
+        return False
+    return isinstance(candidate_node.op, (ast.Add, ast.Sub))

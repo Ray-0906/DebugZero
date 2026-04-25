@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import os
 import re
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -32,6 +34,7 @@ except ImportError:
 try:
     from bug_bank import BugBank, BugSample, build_bug_bank
     from seed_bank import SEED_BANK, SeedSpec, get_seed_by_id
+    from server.bug_injector import infer_bug_operator
     from server.executor import execute_code
     from server.plausibility import compute_ast_distance
     from training.dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
@@ -44,6 +47,7 @@ try:
 except ImportError:
     from ..bug_bank import BugBank, BugSample, build_bug_bank
     from ..seed_bank import SEED_BANK, SeedSpec, get_seed_by_id
+    from ..server.bug_injector import infer_bug_operator
     from ..server.executor import execute_code
     from ..server.plausibility import compute_ast_distance
     from .dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
@@ -64,6 +68,8 @@ DEFAULT_MAX_STEPS = 80
 DEFAULT_MAX_PROMPT_LENGTH = 768
 DEFAULT_MAX_COMPLETION_LENGTH = 256
 DRY_RUN_MAX_STEPS = 2
+DEFAULT_PROPOSER_METRICS_PATH = DEFAULT_OUTPUT_DIR / "proposer_metrics.json"
+TARGETED_PROMPT_RATIO = 0.75
 
 
 def extract_python_code(text: str) -> str:
@@ -101,42 +107,26 @@ def build_mixed_role_dataset(
     rows: list[dict[str, object]] = []
 
     for bug_sample in bug_bank.train_samples:
+        prompt_text = sample_solver_prompt(
+            bug_sample.buggy_code,
+            bug_sample.execution_result,
+            mode="concise",
+        )
         rows.append(
             {
-                "prompt": sample_solver_prompt(
-                    bug_sample.buggy_code,
-                    bug_sample.execution_result,
-                    mode="concise",
-                ),
-                "metadata": {
-                    "role": "solver",
-                    "seed_id": bug_sample.seed_id,
-                    "original_code": bug_sample.original_code,
-                    "buggy_code": bug_sample.buggy_code,
-                    "bug_operator": bug_sample.bug_operator,
-                    "execution_result": bug_sample.execution_result,
-                },
+                "prompt": [{"role": "user", "content": prompt_text}],
+                "role": "solver",
+                "seed_id": bug_sample.seed_id,
+                "original_code": bug_sample.original_code,
+                "buggy_code": bug_sample.buggy_code,
+                "bug_operator": bug_sample.bug_operator,
+                "execution_result": bug_sample.execution_result,
             }
         )
 
-    proposer_rows: list[dict[str, object]] = []
-    for seed in SEED_BANK:
-        proposer_rows.append(
-            {
-                "prompt": sample_proposer_prompt(seed.original_code),
-                "metadata": {
-                    "role": "proposer",
-                    "seed_id": seed.seed_id,
-                    "original_code": seed.original_code,
-                },
-            }
-        )
-
-    target_proposer_rows = max(1, math.ceil(len(rows) / solver_weight)) if rows else len(proposer_rows)
-    while len(proposer_rows) < target_proposer_rows:
-        proposer_rows.extend(proposer_rows[: max(1, target_proposer_rows - len(proposer_rows))])
-
-    rows.extend(proposer_rows[:target_proposer_rows])
+    target_proposer_rows = max(1, math.ceil(len(rows) / solver_weight)) if rows else len(SEED_BANK)
+    proposer_rows = build_weighted_proposer_rows(bug_bank, target_proposer_rows)
+    rows.extend(proposer_rows)
     return Dataset.from_list(rows)
 
 
@@ -145,34 +135,61 @@ def create_dataset() -> tuple[Dataset, BugBank]:
     return build_mixed_role_dataset(bug_bank), bug_bank
 
 
-def reward_fn(prompts, completions, **kwargs):
+def prop_rew(prompts, completions, **kwargs):
     rewards: list[float] = []
-    metadata = kwargs.get("metadata", [])
+    roles = kwargs.get("role", [])
+    seed_ids = kwargs.get("seed_id", [])
+    original_codes = kwargs.get("original_code", [])
 
-    for completion, meta in zip(completions, metadata):
-        seed = get_seed_by_id(meta["seed_id"])
+    for i, completion in enumerate(completions):
+        role = roles[i] if i < len(roles) else roles[0]
+        if role != "proposer":
+            rewards.append(0.0)
+            continue
+            
+        seed_id = seed_ids[i] if i < len(seed_ids) else seed_ids[0]
+        original_code = original_codes[i] if i < len(original_codes) else original_codes[0]
+
+        seed = get_seed_by_id(seed_id)
         candidate_code = extract_python_code(completion_to_text(completion))
         execution_meta = execute_candidate(seed, candidate_code)
 
-        if meta["role"] == "proposer":
-            proposer_meta = {
-                "seed_id": seed.seed_id,
-                "tests_passed": execution_meta["tests_passed"],
-                "syntax_error": execution_meta["syntax_error"],
-                "unsafe_code": execution_meta["unsafe_code"],
-                "unchanged_code": is_effectively_unchanged(
-                    meta["original_code"],
-                    candidate_code,
-                ),
-                "plausibility_score": 0.0,
-            }
-            if not execution_meta["syntax_error"]:
-                proposer_meta["plausibility_score"] = compute_ast_distance(
-                    meta["original_code"],
-                    candidate_code,
-                )
-            rewards.append(compute_proposer_reward(proposer_meta))
+        unchanged_code = is_effectively_unchanged(original_code, candidate_code)
+        changed_but_passing = (
+            (not unchanged_code)
+            and execution_meta["tests_passed"]
+            and (not execution_meta["syntax_error"])
+        )
+        proposer_meta = {
+            "seed_id": seed.seed_id,
+            "tests_passed": execution_meta["tests_passed"],
+            "syntax_error": execution_meta["syntax_error"],
+            "unsafe_code": execution_meta["unsafe_code"],
+            "unchanged_code": unchanged_code,
+            "changed_but_passing": changed_but_passing,
+            "plausibility_score": 0.0,
+        }
+        if not execution_meta["syntax_error"]:
+            proposer_meta["plausibility_score"] = compute_ast_distance(original_code, candidate_code)
+        rewards.append(compute_proposer_reward(proposer_meta))
+
+    return rewards
+
+def solv_rew(prompts, completions, **kwargs):
+    rewards: list[float] = []
+    roles = kwargs.get("role", [])
+    seed_ids = kwargs.get("seed_id", [])
+
+    for i, completion in enumerate(completions):
+        role = roles[i] if i < len(roles) else roles[0]
+        if role != "solver":
+            rewards.append(0.0)
             continue
+            
+        seed_id = seed_ids[i] if i < len(seed_ids) else seed_ids[0]
+        seed = get_seed_by_id(seed_id)
+        candidate_code = extract_python_code(completion_to_text(completion))
+        execution_meta = execute_candidate(seed, candidate_code)
 
         solver_meta = {
             "seed_id": seed.seed_id,
@@ -232,6 +249,7 @@ def evaluate_proposer_fixed_set(model, tokenizer) -> dict[str, float]:
                 "syntax_error": evaluation["syntax_error"],
                 "unsafe_code": evaluation["unsafe_code"],
                 "unchanged_code": unchanged_code,
+                "changed_but_passing": changed_but_passing,
                 "plausibility_score": 0.0
                 if evaluation["syntax_error"]
                 else compute_ast_distance(seed.original_code, candidate_code),
@@ -239,14 +257,19 @@ def evaluate_proposer_fixed_set(model, tokenizer) -> dict[str, float]:
         )
         results.append(
             {
+                "seed_id": seed.seed_id,
                 **evaluation,
                 "reward": reward,
                 "unchanged_code": unchanged_code,
                 "valid_bug": valid_bug,
                 "changed_but_passing": changed_but_passing,
+                "likely_bug_family": infer_bug_operator(seed.original_code, candidate_code) or "unknown",
             }
         )
-    return summarize_proposer_results(results)
+    summary = summarize_proposer_results(results)
+    summary["by_seed"] = summarize_proposer_by_seed(results)
+    summary["by_bug_family"] = summarize_proposer_by_bug_family(results)
+    return summary
 
 
 def summarize_solver_results(results: list[dict[str, object]]) -> dict[str, float]:
@@ -280,10 +303,167 @@ def summarize_proposer_results(results: list[dict[str, object]]) -> dict[str, fl
     }
 
 
+def summarize_proposer_by_seed(results: list[dict[str, object]]) -> dict[str, dict[str, float]]:
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for result in results:
+        grouped[str(result["seed_id"])].append(result)
+
+    summary: dict[str, dict[str, float]] = {}
+    for seed_id, seed_results in grouped.items():
+        total = len(seed_results) or 1
+        summary[seed_id] = {
+            "valid_bug_rate": sum(1 for item in seed_results if item.get("valid_bug")) / total,
+            "unchanged_rate": sum(1 for item in seed_results if item.get("unchanged_code")) / total,
+            "changed_but_passing_rate": sum(
+                1 for item in seed_results if item.get("changed_but_passing")
+            )
+            / total,
+            "mean_reward": sum(float(item["reward"]) for item in seed_results) / total,
+        }
+    return summary
+
+
+def summarize_proposer_by_bug_family(results: list[dict[str, object]]) -> dict[str, dict[str, float]]:
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for result in results:
+        grouped[str(result.get("likely_bug_family", "unknown"))].append(result)
+
+    summary: dict[str, dict[str, float]] = {}
+    for family, family_results in grouped.items():
+        total = len(family_results) or 1
+        summary[family] = {
+            "count": float(total),
+            "valid_bug_rate": sum(1 for item in family_results if item.get("valid_bug")) / total,
+            "mean_reward": sum(float(item["reward"]) for item in family_results) / total,
+        }
+    return summary
+
+
+def build_weighted_proposer_rows(bug_bank: BugBank, target_proposer_rows: int) -> list[dict[str, object]]:
+    if target_proposer_rows <= 0:
+        return []
+
+    prior_seed_rates = load_prior_seed_break_rates()
+    operator_counts = Counter(sample.bug_operator for sample in bug_bank.train_samples)
+    seed_to_operators: dict[str, list[str]] = defaultdict(list)
+    for sample in bug_bank.train_samples:
+        seed_to_operators[sample.seed_id].append(sample.bug_operator)
+
+    seed_weights = {}
+    for seed in SEED_BANK:
+        prior_break_rate = prior_seed_rates.get(seed.seed_id, 0.5)
+        seed_weights[seed.seed_id] = max(1, 1 + round((1.0 - prior_break_rate) * 2))
+
+    rows: list[dict[str, object]] = []
+    focus_counters = Counter()
+    ordered_seeds = sorted(SEED_BANK, key=lambda seed: (-seed_weights[seed.seed_id], seed.seed_id))
+
+    # Keep every seed represented before adding extra weight to weak seeds.
+    for seed in SEED_BANK[:target_proposer_rows]:
+        bug_focus = choose_proposer_bug_focus(
+            seed.seed_id,
+            seed_to_operators[seed.seed_id],
+            operator_counts,
+            focus_counters,
+            len(rows),
+            target_proposer_rows,
+        )
+        prompt_text = sample_proposer_prompt(seed.original_code, bug_focus=bug_focus)
+        rows.append(
+            {
+                "prompt": [{"role": "user", "content": prompt_text}],
+                "role": "proposer",
+                "seed_id": seed.seed_id,
+                "original_code": seed.original_code,
+                "bug_focus": bug_focus if bug_focus else "",
+            }
+        )
+
+    while len(rows) < target_proposer_rows:
+        for seed in ordered_seeds:
+            extra_weight = max(0, seed_weights[seed.seed_id] - 1)
+            for _ in range(extra_weight):
+                if len(rows) >= target_proposer_rows:
+                    break
+                bug_focus = choose_proposer_bug_focus(
+                    seed.seed_id,
+                    seed_to_operators[seed.seed_id],
+                    operator_counts,
+                    focus_counters,
+                    len(rows),
+                    target_proposer_rows,
+                )
+                prompt_text = sample_proposer_prompt(seed.original_code, bug_focus=bug_focus)
+                rows.append(
+                    {
+                        "prompt": [{"role": "user", "content": prompt_text}],
+                        "role": "proposer",
+                        "seed_id": seed.seed_id,
+                        "original_code": seed.original_code,
+                        "bug_focus": bug_focus if bug_focus else "",
+                    }
+                )
+            if len(rows) >= target_proposer_rows:
+                break
+    return rows
+
+
+def choose_proposer_bug_focus(
+    seed_id: str,
+    operators: list[str],
+    operator_counts: Counter,
+    focus_counters: Counter,
+    row_index: int,
+    total_rows: int,
+) -> str | None:
+    unique_operators = sorted(set(operators), key=lambda op: (operator_counts[op], op))
+    if not unique_operators:
+        return None
+    if row_index >= math.ceil(total_rows * TARGETED_PROMPT_RATIO):
+        return None
+
+    del seed_id
+    chosen = min(unique_operators, key=lambda op: (focus_counters[op], operator_counts[op], op))
+    focus_counters[chosen] += 1
+    return chosen
+
+
+def load_prior_seed_break_rates() -> dict[str, float]:
+    if not DEFAULT_PROPOSER_METRICS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(DEFAULT_PROPOSER_METRICS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    seed_metrics = data.get("post_proposer_metrics", {}).get("by_seed", {})
+    return {
+        str(seed_id): float(metrics.get("valid_bug_rate", 0.5))
+        for seed_id, metrics in seed_metrics.items()
+        if isinstance(metrics, dict)
+    }
+
+
+def save_metrics_artifact(
+    pre_proposer_metrics: dict[str, object],
+    post_proposer_metrics: dict[str, object],
+) -> Path:
+    DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    artifact = {
+        "pre_proposer_metrics": pre_proposer_metrics,
+        "post_proposer_metrics": post_proposer_metrics,
+    }
+    DEFAULT_PROPOSER_METRICS_PATH.write_text(
+        json.dumps(artifact, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return DEFAULT_PROPOSER_METRICS_PATH
+
+
 def generate_code(
     model,
     tokenizer,
-    prompt: str,
+    prompt: str | list[dict[str, str]],
     *,
     do_sample: bool,
     max_new_tokens: int = DEFAULT_MAX_COMPLETION_LENGTH,
@@ -294,7 +474,13 @@ def generate_code(
         tokenizer.pad_token = tokenizer.eos_token
 
     model.eval()
-    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=DEFAULT_MAX_PROMPT_LENGTH)
+    
+    if isinstance(prompt, list):
+        prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+    else:
+        prompt_text = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
+        
+    encoded = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=DEFAULT_MAX_PROMPT_LENGTH)
     model_device = next(model.parameters()).device
     encoded = {key: value.to(model_device) for key, value in encoded.items()}
 
@@ -368,14 +554,26 @@ def load_training_model_and_tokenizer(
         )
         return model, tokenizer
 
+    # Unsloth is failing to load (e.g., due to Kaggle/Colab CUDA mismatch).
+    # Falling back to standard HuggingFace PEFT (LoRA).
     print("Unsloth not available. Falling back to standard Transformers loading.")
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import LoraConfig, get_peft_model
 
     tokenizer = AutoTokenizer.from_pretrained(DEFAULT_FALLBACK_MODEL_ID)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(DEFAULT_FALLBACK_MODEL_ID)
+    model = AutoModelForCausalLM.from_pretrained(DEFAULT_FALLBACK_MODEL_ID, torch_dtype=torch.bfloat16, device_map="auto")
+    peft_config = LoraConfig(
+        r=16,
+        lora_alpha=16,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_dropout=0,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, peft_config)
     return model, tokenizer
 
 
@@ -443,6 +641,7 @@ def create_trainer(model, tokenizer, dataset: Dataset, dry_run: bool):
         learning_rate=profile["learning_rate"],
         max_steps=profile["max_steps"],
         num_generations=profile["num_generations"],
+        max_prompt_length=DEFAULT_MAX_PROMPT_LENGTH,
         max_completion_length=profile["max_completion_length"],
         bf16=(not dry_run) and HAS_UNSLOTH and is_bfloat16_supported(),
         fp16=(not dry_run) and not is_bfloat16_supported(),
@@ -450,14 +649,19 @@ def create_trainer(model, tokenizer, dataset: Dataset, dry_run: bool):
         logging_steps=1 if dry_run else 5,
         optim=profile["optim"],
         report_to=profile["report_to"],
+        disable_tqdm=True,
     )
 
+    print(f"Starting GRPO training for {training_args.max_steps} episodes (steps)...")
+    print("To change the number of episodes, modify 'max_steps' in the training profile.")
+    
     return GRPOTrainer(
         model=model,
-        reward_funcs=[reward_fn],
+        reward_funcs=[prop_rew, solv_rew],
         args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
+        
     )
 
 
@@ -550,6 +754,7 @@ def run_workflow(dry_run: bool = False) -> dict[str, object]:
         post_proposer_metrics,
         trainer.state.log_history,
     )
+    metrics_artifact_path = save_metrics_artifact(pre_proposer_metrics, post_proposer_metrics)
 
     results = {
         "train_result": train_result,
@@ -558,6 +763,7 @@ def run_workflow(dry_run: bool = False) -> dict[str, object]:
         "pre_proposer_metrics": pre_proposer_metrics,
         "post_proposer_metrics": post_proposer_metrics,
         "plot_path": str(plot_path) if plot_path else None,
+        "metrics_artifact_path": str(metrics_artifact_path),
         "dataset_size": len(dataset),
         "train_bug_count": len(bug_bank.train_samples),
         "eval_bug_count": len(bug_bank.eval_samples),
@@ -567,6 +773,7 @@ def run_workflow(dry_run: bool = False) -> dict[str, object]:
     print("Post-training proposer metrics:", post_proposer_metrics)
     if plot_path:
         print(f"Saved plot to {plot_path}")
+    print(f"Saved proposer metrics to {metrics_artifact_path}")
 
     return results
 

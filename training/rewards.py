@@ -42,6 +42,9 @@ def compute_proposer_reward(meta: dict) -> float:
     if meta.get("unchanged_code", False):
         return 0.0
 
+    if meta.get("changed_but_passing", False):
+        return -0.1
+
     if meta.get("tests_passed", True):
         return 0.0
 

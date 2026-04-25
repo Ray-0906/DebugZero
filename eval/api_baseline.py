@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from bug_bank import build_bug_bank
 from models import DebugzeroAction
 from seed_bank import SEED_BANK, get_seed_by_id
+from server.bug_injector import infer_bug_operator
 from server.executor import execute_code
 from server.plausibility import compute_ast_distance
 from training.dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
@@ -125,6 +126,8 @@ async def run_live_api_probe(bug_bank) -> dict[str, object] | None:
         "solver_attempts": 0,
         "proposer_successes": 0,
         "solver_successes": 0,
+        "proposer_step1_successes": 0,
+        "proposer_late_successes": 0,
         "proposer_valid_bug_attempts": 0,
         "proposer_unchanged_attempts": 0,
         "proposer_changed_but_passing_attempts": 0,
@@ -132,6 +135,8 @@ async def run_live_api_probe(bug_bank) -> dict[str, object] | None:
         "solver_syntax_errors": 0,
         "proposer_rewards": [],
         "solver_rewards": [],
+        "proposer_bug_family_attempts": {},
+        "episode_details": [],
         "representative_success": None,
         "representative_failure": None,
     }
@@ -183,14 +188,19 @@ async def run_live_api_probe(bug_bank) -> dict[str, object] | None:
                     "syntax_error": obs.syntax_error,
                     "unsafe_code": obs.execution_result.startswith("Unsafe import detected."),
                     "unchanged_code": proposer_attempt["unchanged_code"],
+                    "changed_but_passing": proposer_attempt["changed_but_passing"],
                     "plausibility_score": 0.0
                     if obs.syntax_error
                     else compute_ast_distance(original_code, proposer_code),
                 }
                 proposer_reward = compute_proposer_reward(proposer_meta)
                 metrics["proposer_rewards"].append(proposer_reward)
+                likely_bug_family = infer_bug_operator(original_code, proposer_code) or "unknown"
                 if proposer_attempt["valid_bug"]:
                     metrics["proposer_valid_bug_attempts"] += 1
+                    metrics["proposer_bug_family_attempts"][likely_bug_family] = (
+                        metrics["proposer_bug_family_attempts"].get(likely_bug_family, 0) + 1
+                    )
                 if proposer_attempt["unchanged_code"]:
                     metrics["proposer_unchanged_attempts"] += 1
                 if proposer_attempt["changed_but_passing"]:
@@ -203,6 +213,19 @@ async def run_live_api_probe(bug_bank) -> dict[str, object] | None:
                     proposer_feedback = "You created a valid failing bug. Keep the change small and realistic."
                     proposer_succeeded = True
                     metrics["proposer_successes"] += 1
+                    if proposer_step == 1:
+                        metrics["proposer_step1_successes"] += 1
+                    else:
+                        metrics["proposer_late_successes"] += 1
+                    metrics["episode_details"].append(
+                        {
+                            "seed_id": seed_id,
+                            "role": "proposer",
+                            "step": proposer_step,
+                            "likely_bug_family": likely_bug_family,
+                            "reward": proposer_reward,
+                        }
+                    )
                     if metrics["representative_success"] is None:
                         metrics["representative_success"] = {
                             "role": "proposer",
@@ -308,6 +331,8 @@ def print_live_summary(metrics: dict[str, object]) -> None:
     print("=" * 80)
     print(f"Proposer success rate: {metrics['proposer_successes'] / episodes:.2%}")
     print(f"Solver success rate:   {metrics['solver_successes'] / episodes:.2%}")
+    print(f"Proposer step-1 success rate: {metrics['proposer_step1_successes'] / episodes:.2%}")
+    print(f"Proposer late success rate:   {metrics['proposer_late_successes'] / episodes:.2%}")
     print(f"Proposer valid bug rate: {metrics['proposer_valid_bug_attempts'] / proposer_attempts:.2%}")
     print(f"Proposer unchanged rate: {metrics['proposer_unchanged_attempts'] / proposer_attempts:.2%}")
     print(
@@ -324,6 +349,7 @@ def print_live_summary(metrics: dict[str, object]) -> None:
         f"Average solver reward:   "
         f"{(sum(solver_rewards) / len(solver_rewards)) if solver_rewards else 0.0:.2f}"
     )
+    print(f"Proposer bug families:  {metrics['proposer_bug_family_attempts']}")
     print(f"Representative success: {metrics['representative_success']}")
     print(f"Representative failure: {metrics['representative_failure']}")
 

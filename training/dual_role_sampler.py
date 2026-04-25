@@ -10,9 +10,12 @@ Rules:
 - Keep the code valid Python.
 - Keep the same function signature.
 - Preserve the overall structure and formatting as much as possible.
-- Do not rewrite the whole function or add unrelated edits.
-- Prefer realistic bug types such as boundary, comparison, condition, or slice mistakes.
+- Prefer one of these mutation families: off_by_one, wrong_operator, wrong_builtin,
+  condition_negation, loop_boundary_shift, or slice_boundary_corruption.
+- Aim for an edge-case behavior change, not a cosmetic refactor.
+- Avoid helper extraction, renaming-only edits, comment-only changes, or multi-line rewrites.
 - Return only the full modified Python code inside triple backticks.
+{focus_instruction}
 
 Clean function:
 ```python
@@ -97,8 +100,14 @@ def _truncate_text(text: str, max_chars: int) -> str:
     return cleaned[: max(0, max_chars - 3)].rstrip() + "..."
 
 
-def sample_proposer_prompt(code: str) -> str:
-    return PROPOSER_PROMPT.format(code=code)
+def sample_proposer_prompt(code: str, bug_focus: str | None = None) -> str:
+    focus_instruction = ""
+    if bug_focus:
+        focus_instruction = (
+            f"- Focus specifically on the `{bug_focus}` mutation family.\n"
+            "- Keep the edit local so the bug can be repaired with a small fix."
+        )
+    return PROPOSER_PROMPT.format(code=code, focus_instruction=focus_instruction)
 
 
 def sample_solver_prompt(
