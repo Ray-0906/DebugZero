@@ -39,10 +39,13 @@ except Exception as e:  # pragma: no cover
         "openenv is required for the web interface. Install dependencies with '\n    uv sync\n'"
     ) from e
 
-try:
+if __package__ == "server":
+    from models import DebugzeroAction, DebugzeroObservation
+    from .debugZero_environment import DebugzeroEnvironment
+elif __package__ and __package__.endswith(".server"):
     from ..models import DebugzeroAction, DebugzeroObservation
     from .debugZero_environment import DebugzeroEnvironment
-except ModuleNotFoundError:
+else:
     from models import DebugzeroAction, DebugzeroObservation
     from server.debugZero_environment import DebugzeroEnvironment
 
@@ -53,7 +56,7 @@ app = create_app(
     DebugzeroAction,
     DebugzeroObservation,
     env_name="debugZero",
-    max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
+    max_concurrent_envs=int(os.environ.get("MAX_CONCURRENT_ENVS", "100")),
 )
 
 

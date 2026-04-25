@@ -13,16 +13,18 @@ from uuid import uuid4
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
 
-try:
+if __package__ == "server":
+    from models import DebugzeroAction, DebugzeroObservation, DebugzeroState
+elif __package__ and __package__.endswith(".server"):
     from ..models import DebugzeroAction, DebugzeroObservation, DebugzeroState
-except ImportError:
+else:
     from models import DebugzeroAction, DebugzeroObservation, DebugzeroState
 
-try:
+if __package__:
     from .executor import execute_code, ExecutionResult
     from .bug_injector import inject_bug
     from .plausibility import compute_ast_distance
-except ImportError:
+else:
     from executor import execute_code, ExecutionResult
     from bug_injector import inject_bug
     from plausibility import compute_ast_distance
