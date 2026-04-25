@@ -112,30 +112,74 @@ def compact_action_string(action: DebugzeroAction) -> str:
     )
 
 
+def _indent_block(text: str, spaces: int = 4) -> str:
+    prefix = " " * spaces
+    return "\n".join(f"{prefix}{line}" if line else prefix for line in text.splitlines())
+
+
+def _code_preview(code: str, max_lines: int = 18) -> str:
+    lines = (code or "").strip().splitlines()
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + [f"... ({len(lines) - max_lines} more lines)"]
+    return _indent_block("\n".join(lines) or "(empty)")
+
+
+def _execution_preview(execution_result: str, max_lines: int = 8) -> str:
+    text = (execution_result or "").strip()
+    if not text:
+        return "    (none)"
+
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    useful = [
+        line
+        for line in lines
+        if "AssertionError" in line
+        or "SyntaxError" in line
+        or "Unsafe import" in line
+        or "Execution timed out" in line
+        or "assert candidate" in line
+        or "check(" in line
+    ]
+    selected = useful if useful else lines[-max_lines:]
+    if len(selected) > max_lines:
+        selected = selected[-max_lines:]
+    return _indent_block("\n".join(selected))
+
+
 def log_start(episode: int, env_url: str, model: str, mode: str) -> None:
     print(
-        f"[START] episode={episode} env=debugZero url={env_url} model={model} mode={mode}",
+        "\n"
+        + "=" * 72
+        + f"\nEpisode {episode} | env=debugZero | mode={mode}\n"
+        + f"URL: {env_url}\n"
+        + f"Model: {model}\n"
+        + "=" * 72,
         flush=True,
     )
 
 
 def log_step(
     step: int,
-    role: str,
-    action: str,
+    action: DebugzeroAction,
     reward: float,
     done: bool,
     tests_passed: Optional[bool],
     syntax_error: Optional[bool],
     execution_result: str,
 ) -> None:
-    action_preview = action.replace("\n", "\\n")[:800]
-    result_preview = (execution_result or "").replace("\n", "\\n")[:500]
+    role = action.role
+    status = "PASS" if tests_passed else "FAIL"
+    if syntax_error:
+        status = "SYNTAX_ERROR"
+    done_text = "true" if done else "false"
     print(
-        "[STEP] "
-        f"step={step} role={role} action={action_preview} reward={reward:.2f} "
-        f"done={str(done).lower()} tests_passed={tests_passed} "
-        f"syntax_error={syntax_error} execution_result={result_preview}",
+        f"\n[Step {step}] role={role} status={status}\n"
+        f"  reward={reward:.2f} | done={done_text} | "
+        f"tests_passed={tests_passed} | syntax_error={syntax_error}\n"
+        "  submitted code:\n"
+        f"{_code_preview(action.code)}\n"
+        "  execution summary:\n"
+        f"{_execution_preview(execution_result)}",
         flush=True,
     )
 
@@ -143,7 +187,11 @@ def log_step(
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{reward:.2f}" for reward in rewards)
     print(
-        f"[END] success={str(success).lower()} steps={steps} score={score:.4f} rewards={rewards_str}",
+        "\n"
+        + "-" * 72
+        + f"\nEpisode result: success={str(success).lower()} | "
+        f"steps={steps} | score={score:.4f} | rewards=[{rewards_str}]\n"
+        + "-" * 72,
         flush=True,
     )
 
@@ -420,8 +468,7 @@ async def main() -> None:
 
                     log_step(
                         step=step,
-                        role=action.role,
-                        action=action_str,
+                        action=action,
                         reward=reward,
                         done=done,
                         tests_passed=tests_passed,
