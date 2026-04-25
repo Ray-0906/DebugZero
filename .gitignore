@@ -1,0 +1,36 @@
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Local training and experiment outputs
+debugzero_model/
+
+# Local-only helper and test files
+run_episode.py
+eval/conftest.py
+eval/test_api_baseline.py
+eval/test_bug_bank.py
+eval/test_bug_injector.py
+eval/test_environment_signal.py
+eval/test_executor.py
+eval/test_seed_bank.py
+eval/test_training_pipeline.py
+eval/test_rewards_simulator.py
+eval/plausibility_eval.py

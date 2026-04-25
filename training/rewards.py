@@ -1,45 +1,68 @@
-from collections import deque
+from __future__ import annotations
+
+import ast
 import statistics
+from collections import deque
+
 
 # Global solve rate history buffer: {seed_id: deque(maxlen=20)}
-solve_rate_history = {}
+solve_rate_history: dict[str, deque[float]] = {}
+
+
+def reset_reward_history() -> None:
+    solve_rate_history.clear()
+
 
 def get_solve_rate(seed_id: str) -> float:
-    if seed_id not in solve_rate_history or len(solve_rate_history[seed_id]) == 0:
-        return 0.5  # default baseline if no history yet
-        
+    if seed_id not in solve_rate_history or not solve_rate_history[seed_id]:
+        return 0.5
     return statistics.mean(solve_rate_history[seed_id])
 
-def record_solve_result(seed_id: str, solved: bool):
+
+def record_solve_result(seed_id: str, solved: bool) -> None:
     if seed_id not in solve_rate_history:
         solve_rate_history[seed_id] = deque(maxlen=20)
     solve_rate_history[seed_id].append(1.0 if solved else 0.0)
 
+
+def is_effectively_unchanged(original_code: str, candidate_code: str) -> bool:
+    try:
+        return ast.dump(ast.parse(original_code)) == ast.dump(ast.parse(candidate_code))
+    except SyntaxError:
+        return original_code.strip() == candidate_code.strip()
+
+
 def compute_proposer_reward(meta: dict) -> float:
-    # meta requires: tests_passed, syntax_error, plausibility_score, seed_id
-    validity = 0.0
     if meta.get("syntax_error", False):
-        validity = -1.0
-    elif not meta.get("tests_passed", True):
-        validity = 1.0  # Successfully broke tests
-    else:
-        validity = 0.0  # Ran fine, didn't break tests
-        
-    plausibility = meta.get("plausibility_score", 0.0)
-    
+        return -0.5
+
+    if meta.get("unsafe_code", False):
+        return -0.5
+
+    if meta.get("unchanged_code", False):
+        return 0.0
+
+    if meta.get("tests_passed", True):
+        return 0.0
+
+    plausibility_bonus = meta.get("plausibility_score", 0.0)
+    learnability_bonus = 0.0
     solve_rate = get_solve_rate(meta["seed_id"])
-    learnability = 0.0
-    if 0.1 <= solve_rate <= 0.9:
-        learnability = 1.0
-        
-    return validity + plausibility + learnability
+    if 0.2 <= solve_rate <= 0.8:
+        learnability_bonus = 1.0
+
+    return 1.0 + plausibility_bonus + learnability_bonus
+
 
 def compute_solver_reward(meta: dict) -> float:
-    # meta requires: tests_passed, syntax_error, seed_id
-    solved = meta.get("tests_passed", False) and not meta.get("syntax_error", True)
-    
-    record_solve_result(meta["seed_id"], solved)
-    
+    solved = meta.get("tests_passed", False)
+    syntax_error = meta.get("syntax_error", True)
+    unsafe_code = meta.get("unsafe_code", False)
+
+    record_solve_result(meta["seed_id"], solved and not syntax_error and not unsafe_code)
+
+    if syntax_error or unsafe_code:
+        return -0.5
     if solved:
         return 1.0
     return 0.0

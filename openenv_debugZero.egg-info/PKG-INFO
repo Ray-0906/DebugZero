@@ -5,8 +5,10 @@ Summary: Debugzero environment for OpenEnv
 Requires-Python: >=3.10
 Requires-Dist: datasets>=4.8.4
 Requires-Dist: openenv-core[core]>=0.2.1
+Requires-Dist: openai>=1.0.0
 Requires-Dist: pytest>=9.0.3
 Requires-Dist: thefuzz>=0.22.1
+Requires-Dist: matplotlib>=3.8.0
 Requires-Dist: transformers>=5.6.2
 Requires-Dist: trl>=1.2.0
 Provides-Extra: dev

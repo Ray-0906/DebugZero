@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import tempfile
 import ast
 
@@ -71,7 +72,7 @@ def execute_code(code: str, tests: str, timeout: int = 5) -> ExecutionResult:
         try:
             # We run the process completely isolated with no stdout buffers blocking us
             result = subprocess.run(
-                ["python", temp_file],
+                [sys.executable, temp_file],
                 capture_output=True,
                 text=True,
                 timeout=timeout
