@@ -20,6 +20,17 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# --- vLLM V1 workaround for T4 / older GPUs (compute capability < 8.0) ---
+try:
+    import torch as _torch
+    if _torch.cuda.is_available():
+        _cc = _torch.cuda.get_device_capability()
+        if _cc[0] < 8:
+            os.environ.setdefault("VLLM_USE_V1", "0")
+            os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
+except Exception:
+    pass
+
 from datasets import Dataset
 
 # Re-use everything from the original trainer
