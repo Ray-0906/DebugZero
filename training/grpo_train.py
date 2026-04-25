@@ -76,7 +76,7 @@ DEFAULT_SOLVER_WEIGHT = 2
 DEFAULT_NUM_GENERATIONS = 4
 DEFAULT_MAX_STEPS = 80
 DEFAULT_MAX_PROMPT_LENGTH = 768
-DEFAULT_MAX_COMPLETION_LENGTH = 256
+DEFAULT_MAX_COMPLETION_LENGTH = 512
 DRY_RUN_MAX_STEPS = 2
 
 
@@ -108,6 +108,15 @@ def execute_candidate(seed: SeedSpec, candidate_code: str) -> dict[str, object]:
     }
 
 
+def _to_chat_prompt(text: str) -> list[dict[str, str]]:
+    """Wrap raw prompt text as a chat message list for TRL's GRPOTrainer.
+
+    Qwen2.5-Coder-Instruct requires chat-formatted input to properly generate
+    EOS tokens. Without this, completions max out and training loss stays at 0.
+    """
+    return [{"role": "user", "content": text}]
+
+
 def build_mixed_role_dataset(
     bug_bank: BugBank,
     solver_weight: int = DEFAULT_SOLVER_WEIGHT,
@@ -117,11 +126,11 @@ def build_mixed_role_dataset(
     for bug_sample in bug_bank.train_samples:
         rows.append(
             {
-                "prompt": sample_solver_prompt(
+                "prompt": _to_chat_prompt(sample_solver_prompt(
                     bug_sample.buggy_code,
                     bug_sample.execution_result,
                     mode="concise",
-                ),
+                )),
                 "metadata": {
                     "role": "solver",
                     "seed_id": bug_sample.seed_id,
@@ -137,7 +146,7 @@ def build_mixed_role_dataset(
     for seed in SEED_BANK:
         proposer_rows.append(
             {
-                "prompt": sample_proposer_prompt(seed.original_code),
+                "prompt": _to_chat_prompt(sample_proposer_prompt(seed.original_code)),
                 "metadata": {
                     "role": "proposer",
                     "seed_id": seed.seed_id,
@@ -308,9 +317,17 @@ def generate_code(
         tokenizer.pad_token = tokenizer.eos_token
 
     model.eval()
-    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=DEFAULT_MAX_PROMPT_LENGTH)
+
+    # Apply chat template so the model sees proper <|im_start|>/<|im_end|> tokens
+    # and knows when to produce EOS.
+    messages = [{"role": "user", "content": prompt}]
+    chat_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+    encoded = tokenizer(chat_text, return_tensors="pt", truncation=True, max_length=DEFAULT_MAX_PROMPT_LENGTH)
     model_device = next(model.parameters()).device
     encoded = {key: value.to(model_device) for key, value in encoded.items()}
+    prompt_len = encoded["input_ids"].shape[1]
 
     generation_kwargs = {
         "max_new_tokens": max_new_tokens,
@@ -325,9 +342,10 @@ def generate_code(
     with torch.no_grad():
         output = model.generate(**encoded, **generation_kwargs)
 
-    decoded = tokenizer.decode(output[0], skip_special_tokens=True)
-    completion = decoded[len(prompt) :] if decoded.startswith(prompt) else decoded
-    return extract_python_code(completion)
+    # Decode only the new tokens (skip the prompt)
+    completion_ids = output[0][prompt_len:]
+    decoded = tokenizer.decode(completion_ids, skip_special_tokens=True)
+    return extract_python_code(decoded)
 
 
 def get_training_profile(dry_run: bool) -> dict[str, int | float | bool | str]:
