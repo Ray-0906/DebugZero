@@ -7,6 +7,7 @@ DebugZero GRPO training — AZR philosophy, TRL + Unsloth stack.
 from __future__ import annotations
 
 import argparse
+import inspect
 import math
 import os
 import re
@@ -39,6 +40,58 @@ DEFAULT_OUTPUT_DIR = "outputs/debugzero_grpo"
 DEFAULT_STEPS = 50
 DEFAULT_G = 4
 DEFAULT_BATCH_SIZE = 2
+DEFAULT_KL_COEF = 0.01
+
+
+def build_grpo_config(GRPOConfig, torch, args):
+    """
+    Build a GRPOConfig across TRL/Unsloth versions.
+
+    Older releases used kl_coef for the KL penalty. Newer TRL-compatible
+    versions expose the same concept as beta. Keep the intended coefficient
+    while only passing constructor parameters supported by the installed class.
+    """
+    kwargs = {
+        "output_dir": args.output_dir,
+        "max_steps": args.steps,
+        "num_generations": args.g,
+        "per_device_train_batch_size": args.batch_size,
+        "gradient_accumulation_steps": 1,
+        "max_completion_length": 512,
+        "max_prompt_length": 768,
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "learning_rate": 1e-6,               # same as AZR paper
+        "optim": "adamw_8bit",
+        "lr_scheduler_type": "constant",      # AZR uses constant LR
+        "bf16": torch.cuda.is_bf16_supported(),
+        "fp16": not torch.cuda.is_bf16_supported(),
+        "logging_steps": 5,
+        "save_steps": 25,
+        "report_to": "none",
+    }
+
+    signature = inspect.signature(GRPOConfig.__init__)
+    params = signature.parameters
+    accepts_extra_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in params.values()
+    )
+
+    if accepts_extra_kwargs or "kl_coef" in params:
+        kwargs["kl_coef"] = DEFAULT_KL_COEF
+    elif "beta" in params:
+        kwargs["beta"] = DEFAULT_KL_COEF
+
+    if accepts_extra_kwargs:
+        return GRPOConfig(**kwargs)
+
+    supported_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in params
+    }
+    return GRPOConfig(**supported_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -322,26 +375,7 @@ def train(args):
     # ── GRPO config ───────────────────────────────────────────
     from trl import GRPOConfig, GRPOTrainer
 
-    cfg = GRPOConfig(
-        output_dir=args.output_dir,
-        max_steps=args.steps,
-        num_generations=args.g,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=1,
-        max_completion_length=512,
-        max_prompt_length=768,
-        temperature=0.8,
-        top_p=0.95,
-        learning_rate=1e-6,               # same as AZR paper
-        kl_coef=0.01,
-        optim="adamw_8bit",
-        lr_scheduler_type="constant",      # AZR uses constant LR
-        bf16=torch.cuda.is_bf16_supported(),
-        fp16=not torch.cuda.is_bf16_supported(),
-        logging_steps=5,
-        save_steps=25,
-        report_to="none",
-    )
+    cfg = build_grpo_config(GRPOConfig, torch, args)
 
     trainer = GRPOTrainer(
         model=model,
