@@ -1,626 +1,438 @@
+"""
+DebugZero GRPO training — AZR philosophy, TRL + Unsloth stack.
+
+  python training/grpo_train.py --dry_run
+  python training/grpo_train.py --model unsloth/Qwen2.5-Coder-3B-Instruct
+"""
 from __future__ import annotations
 
-import importlib.util
+import argparse
 import math
 import os
 import re
 import sys
-from pathlib import Path
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import numpy as np
 
-# --- vLLM V1 workaround for T4 / older GPUs (compute capability < 8.0) ---
-# The V1 engine uses torch.compile which crashes on T4 with:
-#   "RuntimeError: Tried to erase Node size_3 but it still had 1 users in the graph"
-# Disabling V1 and using eager mode fixes this.
-try:
-    import torch as _torch
-    if _torch.cuda.is_available():
-        _cc = _torch.cuda.get_device_capability()
-        if _cc[0] < 8:
-            os.environ.setdefault("VLLM_USE_V1", "0")
-            os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
-except Exception:
-    pass
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from datasets import Dataset
 
-try:
-    from unsloth import FastLanguageModel, is_bfloat16_supported
+from server.bug_bank import BugBank, BugSample, build_bug_bank
+from server.executor import execute_code
+from server.plausibility import compute_ast_distance
+from server.rewards import (
+    compute_proposer_reward,
+    compute_solver_reward,
+    is_effectively_unchanged,
+    reset_reward_history,
+)
+from server.seed_bank import SEED_BANK, SeedSpec, get_seed_by_id
+from training.dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
 
-    HAS_UNSLOTH = True
-except ImportError:
-    HAS_UNSLOTH = False
 
-    def is_bfloat16_supported() -> bool:
-        return False
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+DEFAULT_MODEL = "unsloth/Qwen2.5-Coder-3B-Instruct"
+DEFAULT_OUTPUT_DIR = "outputs/debugzero_grpo"
+DEFAULT_STEPS = 50
+DEFAULT_G = 4
+DEFAULT_BATCH_SIZE = 2
 
 
-try:
-    from unsloth import PatchFastRL
+# ---------------------------------------------------------------------------
+# Step 1 — Unsloth model loading
+# ---------------------------------------------------------------------------
+def load_model_and_tokenizer(model_name: str, max_seq_len: int = 1280):
+    from unsloth import FastLanguageModel
 
-    PatchFastRL("GRPO", FastLanguageModel)
-except ImportError:
-    pass
-
-try:
-    from server.bug_bank import BugBank, BugSample, build_bug_bank
-    from server.executor import execute_code
-    from server.plausibility import compute_ast_distance
-    from server.rewards import (
-        compute_proposer_reward,
-        compute_solver_reward,
-        is_effectively_unchanged,
-        reset_reward_history,
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=max_seq_len,
+        dtype=None,          # auto: bf16 on Ampere+, fp16 otherwise
+        load_in_4bit=True,   # QLoRA — fits 3B on a single 16 GB GPU
     )
-    from server.seed_bank import SEED_BANK, SeedSpec, get_seed_by_id
-    from training.dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
-except ImportError:
-    from ..server.bug_bank import BugBank, BugSample, build_bug_bank
-    from ..server.executor import execute_code
-    from ..server.plausibility import compute_ast_distance
-    from ..server.rewards import (
-        compute_proposer_reward,
-        compute_solver_reward,
-        is_effectively_unchanged,
-        reset_reward_history,
+
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=16,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        lora_alpha=16,
+        lora_dropout=0,
+        bias="none",
+        use_gradient_checkpointing="unsloth",   # 30 % less VRAM
+        random_state=42,
     )
-    from ..server.seed_bank import SEED_BANK, SeedSpec, get_seed_by_id
-    from .dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
+
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"   # required for GRPO generation
+    return model, tokenizer
 
 
-DEFAULT_MODEL_ID = "unsloth/Qwen2.5-Coder-3B-Instruct"
-DEFAULT_FALLBACK_MODEL_ID = "Qwen/Qwen2.5-Coder-3B-Instruct"
-DEFAULT_OUTPUT_DIR = Path("debugzero_model")
-DEFAULT_SOLVER_WEIGHT = 2
-DEFAULT_NUM_GENERATIONS = 4
-DEFAULT_MAX_STEPS = 80
-DEFAULT_MAX_PROMPT_LENGTH = 768
-DEFAULT_MAX_COMPLETION_LENGTH = 512
-DRY_RUN_MAX_STEPS = 2
-
-
-def extract_python_code(text: str) -> str:
-    match = re.search(r"```(?:python)?\s(.*?)```", text, flags=re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return text.strip()
-
-
-def completion_to_text(completion) -> str:
-    if isinstance(completion, list) and completion:
-        item = completion[0]
-        if isinstance(item, dict):
-            return item.get("content", "")
-        return str(item)
-    return str(completion)
-
-
-def execute_candidate(seed: SeedSpec, candidate_code: str) -> dict[str, object]:
-    result = execute_code(candidate_code, seed.test)
-    execution_result = result.output[:500] if result.output else ""
-    unsafe_code = execution_result.startswith("Unsafe import detected.")
-    return {
-        "tests_passed": result.passed,
-        "syntax_error": result.syntax_error,
-        "unsafe_code": unsafe_code,
-        "execution_result": execution_result,
-    }
-
-
-def _to_chat_prompt(text: str) -> list[dict[str, str]]:
-    """Wrap raw prompt text as a chat message list for TRL's GRPOTrainer.
-
-    Qwen2.5-Coder-Instruct requires chat-formatted input to properly generate
-    EOS tokens. Without this, completions max out and training loss stays at 0.
+# ---------------------------------------------------------------------------
+# Step 2 — Build the mixed-role dataset
+# ---------------------------------------------------------------------------
+def build_dataset(bug_bank: BugBank, solver_ratio: float = 0.67) -> Dataset:
     """
-    return [{"role": "user", "content": text}]
+    AZR philosophy: one unified dataset, two roles.
+    Each row carries metadata the reward function needs.
+    """
+    rows: list[dict] = []
 
-
-def build_mixed_role_dataset(
-    bug_bank: BugBank,
-    solver_weight: int = DEFAULT_SOLVER_WEIGHT,
-) -> Dataset:
-    rows: list[dict[str, object]] = []
-
-    for bug_sample in bug_bank.train_samples:
-        rows.append(
-            {
-                "prompt": _to_chat_prompt(sample_solver_prompt(
-                    bug_sample.buggy_code,
-                    bug_sample.execution_result,
-                    mode="concise",
-                )),
-                "metadata": {
-                    "role": "solver",
-                    "seed_id": bug_sample.seed_id,
-                    "original_code": bug_sample.original_code,
-                    "buggy_code": bug_sample.buggy_code,
-                    "bug_operator": bug_sample.bug_operator,
-                    "execution_result": bug_sample.execution_result,
-                },
-            }
+    # --- Solver rows: see buggy code + failure, fix it ---
+    for s in bug_bank.train_samples:
+        prompt_text = sample_solver_prompt(
+            s.buggy_code, s.execution_result, mode="concise",
         )
+        rows.append({
+            "prompt": [{"role": "user", "content": prompt_text}],
+            "role": "solver",
+            "seed_id": s.seed_id,
+            "original_code": s.original_code,
+            "buggy_code": s.buggy_code,
+            "execution_result": s.execution_result,
+        })
 
-    proposer_rows: list[dict[str, object]] = []
-    for seed in SEED_BANK:
-        proposer_rows.append(
-            {
-                "prompt": _to_chat_prompt(sample_proposer_prompt(seed.original_code)),
-                "metadata": {
-                    "role": "proposer",
-                    "seed_id": seed.seed_id,
-                    "original_code": seed.original_code,
-                },
-            }
-        )
+    # --- Proposer rows: see clean code, inject a realistic bug ---
+    n_prop = max(1, int(len(rows) * (1 - solver_ratio) / solver_ratio))
+    for i in range(n_prop):
+        seed = SEED_BANK[i % len(SEED_BANK)]
+        prompt_text = sample_proposer_prompt(seed.original_code)
+        rows.append({
+            "prompt": [{"role": "user", "content": prompt_text}],
+            "role": "proposer",
+            "seed_id": seed.seed_id,
+            "original_code": seed.original_code,
+            "buggy_code": "",
+            "execution_result": "",
+        })
 
-    target_proposer_rows = max(1, math.ceil(len(rows) / solver_weight)) if rows else len(proposer_rows)
-    while len(proposer_rows) < target_proposer_rows:
-        proposer_rows.extend(proposer_rows[: max(1, target_proposer_rows - len(proposer_rows))])
-
-    rows.extend(proposer_rows[:target_proposer_rows])
     return Dataset.from_list(rows)
 
 
-def create_dataset() -> tuple[Dataset, BugBank]:
-    bug_bank = build_bug_bank()
-    return build_mixed_role_dataset(bug_bank), bug_bank
+# ---------------------------------------------------------------------------
+# Step 3 — Code extraction helper
+# ---------------------------------------------------------------------------
+def extract_code(text: str) -> str:
+    """Pull the first ```python block out, or return raw text."""
+    m = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"```\s*(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
 
 
-def reward_fn(prompts, completions, **kwargs):
-    rewards: list[float] = []
-    metadata = kwargs.get("metadata", [])
+# ---------------------------------------------------------------------------
+# Step 4 — TRR++ (the core AZR trick)
+# ---------------------------------------------------------------------------
+def trr_plus_plus(rewards: list[float], roles: list[str]) -> list[float]:
+    """
+    Task-Relative REINFORCE++ (TRR++).
 
-    for completion, meta in zip(completions, metadata):
-        seed = get_seed_by_id(meta["seed_id"])
-        candidate_code = extract_python_code(completion_to_text(completion))
-        execution_meta = execute_candidate(seed, candidate_code)
+    AZR computes 6 baselines (3 task types × 2 roles).
+    DebugZero has 2 roles, so we compute 2 baselines.
 
-        if meta["role"] == "proposer":
-            proposer_meta = {
-                "seed_id": seed.seed_id,
-                "tests_passed": execution_meta["tests_passed"],
-                "syntax_error": execution_meta["syntax_error"],
-                "unsafe_code": execution_meta["unsafe_code"],
-                "unchanged_code": is_effectively_unchanged(
-                    meta["original_code"],
-                    candidate_code,
-                ),
-                "plausibility_score": 0.0,
-            }
-            if not execution_meta["syntax_error"]:
-                proposer_meta["plausibility_score"] = compute_ast_distance(
-                    meta["original_code"],
-                    candidate_code,
-                )
-            rewards.append(compute_proposer_reward(proposer_meta))
+    Without this: proposer rewards (0 to ~2.5) and solver rewards
+    (binary -0.5/0/1) are on different scales. The proposer's higher
+    variance dominates the gradient and kills solver learning.
+
+    With this: each role's rewards are z-scored within that role's
+    slice of the batch, giving equal gradient weight to both roles.
+    """
+    r = np.array(rewards, dtype=np.float32)
+    out = np.zeros_like(r)
+    for role in ("proposer", "solver"):
+        mask = np.array([x == role for x in roles])
+        if mask.sum() < 2:
+            out[mask] = r[mask]
             continue
-
-        solver_meta = {
-            "seed_id": seed.seed_id,
-            "tests_passed": execution_meta["tests_passed"],
-            "syntax_error": execution_meta["syntax_error"],
-            "unsafe_code": execution_meta["unsafe_code"],
-        }
-        rewards.append(compute_solver_reward(solver_meta))
-
-    return rewards
+        slice_ = r[mask]
+        out[mask] = (slice_ - slice_.mean()) / (slice_.std() + 1e-8)
+    return out.tolist()
 
 
-def evaluate_bug_sample(candidate_code: str, bug_sample: BugSample) -> dict[str, object]:
-    seed = get_seed_by_id(bug_sample.seed_id)
-    evaluation = execute_candidate(seed, candidate_code)
-    reward = compute_solver_reward(
-        {
-            "seed_id": bug_sample.seed_id,
-            "tests_passed": evaluation["tests_passed"],
-            "syntax_error": evaluation["syntax_error"],
-            "unsafe_code": evaluation["unsafe_code"],
-        }
-    )
-    return {**evaluation, "reward": reward}
+# ---------------------------------------------------------------------------
+# Step 5 — Reward function wired to the DebugZero environment
+# ---------------------------------------------------------------------------
+def make_reward_fn(dataset: Dataset):
+    """
+    Build the reward function that GRPOTrainer will call.
+
+    TRL signature: fn(prompts, completions, **kwargs) -> list[float]
+
+    We apply TRR++ so that by the time TRL uses these as advantages,
+    they're already role-normalized.
+    """
+    # Fast lookup: prompt content → row metadata
+    meta_by_prompt: dict[str, dict] = {}
+    for row in dataset:
+        # The prompt is a list of dicts; use the user content as key
+        key = row["prompt"][0]["content"] if isinstance(row["prompt"], list) else row["prompt"]
+        meta_by_prompt[key] = row
+
+    def reward_fn(prompts, completions, **kwargs):
+        rewards, roles = [], []
+
+        for prompt, completion in zip(prompts, completions):
+            # Resolve prompt key — TRL may pass the formatted string
+            if isinstance(prompt, list):
+                key = prompt[0]["content"]
+            else:
+                key = prompt
+
+            meta = meta_by_prompt.get(key, {})
+            role = meta.get("role", "solver")
+
+            # Extract code from the model's completion
+            if isinstance(completion, list):
+                comp_text = completion[0]["content"] if completion else ""
+            elif isinstance(completion, dict):
+                comp_text = completion.get("content", str(completion))
+            else:
+                comp_text = str(completion)
+            code = extract_code(comp_text)
+
+            seed = get_seed_by_id(meta["seed_id"])
+            result = execute_code(code, seed.test)
+            unsafe = not __import__("server.executor", fromlist=["is_safe"]).is_safe(code)
+
+            if role == "solver":
+                solver_meta = {
+                    "seed_id": seed.seed_id,
+                    "tests_passed": result.passed,
+                    "syntax_error": result.syntax_error,
+                    "unsafe_code": unsafe,
+                }
+                r = compute_solver_reward(solver_meta)
+            else:
+                proposer_meta = {
+                    "seed_id": seed.seed_id,
+                    "tests_passed": result.passed,
+                    "syntax_error": result.syntax_error,
+                    "unsafe_code": unsafe,
+                    "unchanged_code": is_effectively_unchanged(
+                        meta.get("original_code", ""), code,
+                    ),
+                    "plausibility_score": 0.0,
+                }
+                if not result.syntax_error:
+                    proposer_meta["plausibility_score"] = compute_ast_distance(
+                        meta.get("original_code", ""), code,
+                    )
+                r = compute_proposer_reward(proposer_meta)
+
+            rewards.append(float(r))
+            roles.append(role)
+
+        # Apply TRR++ before returning to TRL
+        return trr_plus_plus(rewards, roles)
+
+    return reward_fn
 
 
-def evaluate_solver_fixed_set(model, tokenizer, bug_bank: BugBank) -> dict[str, float]:
-    results = []
-    for bug_sample in bug_bank.eval_samples:
-        prompt = sample_solver_prompt(
-            bug_sample.buggy_code,
-            bug_sample.execution_result,
-            mode="concise",
-        )
-        candidate_code = generate_code(model, tokenizer, prompt, do_sample=False)
-        results.append(evaluate_bug_sample(candidate_code, bug_sample))
-    return summarize_solver_results(results)
-
-
-def evaluate_proposer_fixed_set(model, tokenizer) -> dict[str, float]:
-    results = []
-    for seed in SEED_BANK:
-        prompt = sample_proposer_prompt(seed.original_code)
-        candidate_code = generate_code(model, tokenizer, prompt, do_sample=False)
-        evaluation = execute_candidate(seed, candidate_code)
-        unchanged_code = is_effectively_unchanged(seed.original_code, candidate_code)
-        valid_bug = (not evaluation["tests_passed"]) and (not evaluation["syntax_error"])
-        changed_but_passing = (
-            (not unchanged_code)
-            and evaluation["tests_passed"]
-            and (not evaluation["syntax_error"])
-        )
-        reward = compute_proposer_reward(
-            {
-                "seed_id": seed.seed_id,
-                "tests_passed": evaluation["tests_passed"],
-                "syntax_error": evaluation["syntax_error"],
-                "unsafe_code": evaluation["unsafe_code"],
-                "unchanged_code": unchanged_code,
-                "plausibility_score": 0.0
-                if evaluation["syntax_error"]
-                else compute_ast_distance(seed.original_code, candidate_code),
-            }
-        )
-        results.append(
-            {
-                **evaluation,
-                "reward": reward,
-                "unchanged_code": unchanged_code,
-                "valid_bug": valid_bug,
-                "changed_but_passing": changed_but_passing,
-            }
-        )
-    return summarize_proposer_results(results)
-
-
-def summarize_solver_results(results: list[dict[str, object]]) -> dict[str, float]:
-    total = len(results) or 1
-    passed = sum(1 for result in results if result["tests_passed"])
-    syntax_errors = sum(1 for result in results if result["syntax_error"])
-    mean_reward = sum(float(result["reward"]) for result in results) / total
-    return {
-        "pass_rate": passed / total,
-        "syntax_error_rate": syntax_errors / total,
-        "mean_reward": mean_reward,
-    }
-
-
-def summarize_proposer_results(results: list[dict[str, object]]) -> dict[str, float]:
-    total = len(results) or 1
-    bug_rate = sum(
-        1 for result in results if (not result["tests_passed"]) and (not result["syntax_error"])
-    )
-    unchanged = sum(1 for result in results if result.get("unchanged_code"))
-    changed_but_passing = sum(1 for result in results if result.get("changed_but_passing"))
-    syntax_errors = sum(1 for result in results if result["syntax_error"])
-    mean_reward = sum(float(result["reward"]) for result in results) / total
-    return {
-        "break_rate": bug_rate / total,
-        "valid_bug_rate": bug_rate / total,
-        "unchanged_rate": unchanged / total,
-        "changed_but_passing_rate": changed_but_passing / total,
-        "syntax_error_rate": syntax_errors / total,
-        "mean_reward": mean_reward,
-    }
-
-
-def generate_code(
-    model,
-    tokenizer,
-    prompt: str,
-    *,
-    do_sample: bool,
-    max_new_tokens: int = DEFAULT_MAX_COMPLETION_LENGTH,
-) -> str:
+# ---------------------------------------------------------------------------
+# Step 6 — Quick holdout eval
+# ---------------------------------------------------------------------------
+def quick_eval(model, tokenizer, bug_bank: BugBank, n: int = 6):
     import torch
+    from unsloth import FastLanguageModel
+    FastLanguageModel.for_inference(model)
 
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model.eval()
-
-    # Apply chat template so the model sees proper <|im_start|>/<|im_end|> tokens
-    # and knows when to produce EOS.
-    messages = [{"role": "user", "content": prompt}]
-    chat_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-    )
-    encoded = tokenizer(chat_text, return_tensors="pt", truncation=True, max_length=DEFAULT_MAX_PROMPT_LENGTH)
-    model_device = next(model.parameters()).device
-    encoded = {key: value.to(model_device) for key, value in encoded.items()}
-    prompt_len = encoded["input_ids"].shape[1]
-
-    generation_kwargs = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": do_sample,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-    }
-    if do_sample:
-        generation_kwargs["temperature"] = 0.7
-        generation_kwargs["top_p"] = 0.95
+    device = next(model.parameters()).device
+    s_hits, p_hits = [], []
 
     with torch.no_grad():
-        output = model.generate(**encoded, **generation_kwargs)
+        # Solver eval
+        for samp in bug_bank.eval_samples[:n]:
+            prompt = sample_solver_prompt(
+                samp.buggy_code, samp.execution_result, mode="concise",
+            )
+            messages = [{"role": "user", "content": prompt}]
+            chat_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            ids = tokenizer(chat_text, return_tensors="pt",
+                            truncation=True, max_length=768).to(device)
+            out = model.generate(**ids, max_new_tokens=512, do_sample=False,
+                                 pad_token_id=tokenizer.pad_token_id)
+            code = extract_code(
+                tokenizer.decode(out[0][ids["input_ids"].shape[1]:],
+                                 skip_special_tokens=True))
+            seed = get_seed_by_id(samp.seed_id)
+            result = execute_code(code, seed.test)
+            s_hits.append(result.passed)
 
-    # Decode only the new tokens (skip the prompt)
-    completion_ids = output[0][prompt_len:]
-    decoded = tokenizer.decode(completion_ids, skip_special_tokens=True)
-    return extract_python_code(decoded)
+        # Proposer eval
+        for seed in SEED_BANK[:3]:
+            prompt = sample_proposer_prompt(seed.original_code)
+            messages = [{"role": "user", "content": prompt}]
+            chat_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            ids = tokenizer(chat_text, return_tensors="pt",
+                            truncation=True, max_length=768).to(device)
+            out = model.generate(**ids, max_new_tokens=512, do_sample=False,
+                                 pad_token_id=tokenizer.pad_token_id)
+            code = extract_code(
+                tokenizer.decode(out[0][ids["input_ids"].shape[1]:],
+                                 skip_special_tokens=True))
+            result = execute_code(code, seed.test)
+            valid_bug = (not result.passed) and (not result.syntax_error)
+            p_hits.append(valid_bug)
 
-
-def get_training_profile(dry_run: bool) -> dict[str, int | float | bool | str]:
-    has_bitsandbytes = importlib.util.find_spec("bitsandbytes") is not None
-    return {
-        "per_device_train_batch_size": 1,
-        "gradient_accumulation_steps": 4,
-        "learning_rate": 2e-5,
-        "max_steps": DRY_RUN_MAX_STEPS if dry_run else DEFAULT_MAX_STEPS,
-        "num_generations": 2 if dry_run else DEFAULT_NUM_GENERATIONS,
-        "max_completion_length": DEFAULT_MAX_COMPLETION_LENGTH,
-        "report_to": "none",
-        "optim": "adamw_torch" if dry_run or not has_bitsandbytes else "adamw_8bit",
-    }
-
-
-def load_training_model_and_tokenizer(
-    dry_run: bool,
-    dataset: Dataset,
-    bug_bank: BugBank,
-):
-    if dry_run:
-        return build_tiny_local_model_and_tokenizer(dataset, bug_bank)
-
-    if HAS_UNSLOTH:
-        print("Initializing Unsloth FastLanguageModel...")
-        # T4 GPUs (compute capability < 8.0) crash with vLLM's torch.compile,
-        # so we disable fast_inference (vLLM) and fall back to HF generate.
-        import torch as _t
-        use_fast = True
-        if _t.cuda.is_available() and _t.cuda.get_device_capability()[0] < 8:
-            print("T4 GPU detected (CC<8) — disabling vLLM fast_inference to avoid torch.compile crash")
-            use_fast = False
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=DEFAULT_MODEL_ID,
-            max_seq_length=DEFAULT_MAX_PROMPT_LENGTH + DEFAULT_MAX_COMPLETION_LENGTH,
-            load_in_4bit=True,
-            fast_inference=use_fast,
-        )
-        model = FastLanguageModel.get_peft_model(
-            model,
-            r=16,
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-            lora_alpha=16,
-            lora_dropout=0,
-            bias="none",
-            use_gradient_checkpointing="unsloth",
-            random_state=3407,
-            use_rslora=False,
-            loftq_config=None,
-        )
-        return model, tokenizer
-
-    print("Unsloth not available. Falling back to standard Transformers loading.")
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_FALLBACK_MODEL_ID)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(DEFAULT_FALLBACK_MODEL_ID)
-    return model, tokenizer
-
-
-def build_tiny_local_model_and_tokenizer(dataset: Dataset, bug_bank: BugBank):
-    from tokenizers import Tokenizer
-    from tokenizers.models import WordLevel
-    from tokenizers.pre_tokenizers import Whitespace
-    from tokenizers.trainers import WordLevelTrainer
-    from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
-
-    corpus = [row["prompt"] for row in dataset]
-    corpus.extend(sample.original_code for sample in bug_bank.train_samples)
-    corpus.extend(sample.buggy_code for sample in bug_bank.train_samples)
-    corpus.extend(sample.original_code for sample in bug_bank.eval_samples)
-    corpus.extend(sample.buggy_code for sample in bug_bank.eval_samples)
-    corpus.extend(seed.test for seed in SEED_BANK)
-
-    tokenizer_object = Tokenizer(WordLevel(unk_token="<unk>"))
-    tokenizer_object.pre_tokenizer = Whitespace()
-    trainer = WordLevelTrainer(
-        special_tokens=["<pad>", "<bos>", "<eos>", "<unk>"],
-        min_frequency=1,
-    )
-    tokenizer_object.train_from_iterator(corpus, trainer=trainer)
-
-    tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=tokenizer_object,
-        bos_token="<bos>",
-        eos_token="<eos>",
-        unk_token="<unk>",
-        pad_token="<pad>",
+    FastLanguageModel.for_training(model)
+    return (
+        float(np.mean(s_hits)) if s_hits else 0.0,
+        float(np.mean(p_hits)) if p_hits else 0.0,
     )
 
-    model_config = GPT2Config(
-        vocab_size=tokenizer.vocab_size,
-        n_positions=DEFAULT_MAX_PROMPT_LENGTH + DEFAULT_MAX_COMPLETION_LENGTH,
-        n_ctx=DEFAULT_MAX_PROMPT_LENGTH + DEFAULT_MAX_COMPLETION_LENGTH,
-        n_embd=128,
-        n_layer=2,
-        n_head=2,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-    )
-    model = GPT2LMHeadModel(model_config)
-    return model, tokenizer
 
+# ---------------------------------------------------------------------------
+# Step 7 — Main training function
+# ---------------------------------------------------------------------------
+def train(args):
+    import torch
 
-def get_trl_classes():
-    if os.name == "nt" and not sys.flags.utf8_mode:
-        print("Windows detected. Use `python -X utf8` when running this file locally.")
+    print(f"\n{'=' * 55}")
+    print(f"  DebugZero GRPO  |  {args.model}")
+    print(f"  Steps: {args.steps}  |  G rollouts: {args.g}")
+    print(f"{'=' * 55}\n")
+
+    # ── data ──────────────────────────────────────────────────
+    bug_bank = build_bug_bank()
+    dataset = build_dataset(bug_bank)
+    n_solver = sum(1 for r in dataset["role"] if r == "solver")
+    n_proposer = sum(1 for r in dataset["role"] if r == "proposer")
+    print(f"Bug bank : {len(bug_bank.train_samples)} train / "
+          f"{len(bug_bank.eval_samples)} eval")
+    print(f"Dataset  : {len(dataset)} rows ({n_solver} solver / {n_proposer} proposer)")
+
+    # ── model ─────────────────────────────────────────────────
+    model, tokenizer = load_model_and_tokenizer(args.model)
+
+    # ── reward fn ─────────────────────────────────────────────
+    reward_fn = make_reward_fn(dataset)
+
+    # ── GRPO config ───────────────────────────────────────────
     from trl import GRPOConfig, GRPOTrainer
 
-    return GRPOConfig, GRPOTrainer
-
-
-def create_trainer(model, tokenizer, dataset: Dataset, dry_run: bool, max_steps_override: int | None = None):
-    GRPOConfig, GRPOTrainer = get_trl_classes()
-    profile = get_training_profile(dry_run)
-
-    max_steps = max_steps_override if max_steps_override is not None else profile["max_steps"]
-
-    training_args = GRPOConfig(
-        output_dir=str(DEFAULT_OUTPUT_DIR),
-        per_device_train_batch_size=profile["per_device_train_batch_size"],
-        gradient_accumulation_steps=profile["gradient_accumulation_steps"],
-        learning_rate=profile["learning_rate"],
-        max_steps=max_steps,
-        num_generations=profile["num_generations"],
-        max_completion_length=profile["max_completion_length"],
-        bf16=(not dry_run) and HAS_UNSLOTH and is_bfloat16_supported(),
-        fp16=(not dry_run) and not is_bfloat16_supported(),
-        use_cpu=dry_run,
-        logging_steps=1 if dry_run else 5,
-        optim=profile["optim"],
-        report_to=profile["report_to"],
+    cfg = GRPOConfig(
+        output_dir=args.output_dir,
+        max_steps=args.steps,
+        num_generations=args.g,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=1,
+        max_completion_length=512,
+        max_prompt_length=768,
+        temperature=0.8,
+        top_p=0.95,
+        learning_rate=1e-6,               # same as AZR paper
+        kl_coef=0.01,
+        optim="adamw_8bit",
+        lr_scheduler_type="constant",      # AZR uses constant LR
+        bf16=torch.cuda.is_bf16_supported(),
+        fp16=not torch.cuda.is_bf16_supported(),
+        logging_steps=5,
+        save_steps=25,
+        report_to="none",
     )
 
-    return GRPOTrainer(
+    trainer = GRPOTrainer(
         model=model,
-        reward_funcs=[reward_fn],
-        args=training_args,
+        args=cfg,
         train_dataset=dataset,
+        reward_funcs=[reward_fn],
         processing_class=tokenizer,
     )
 
-
-def save_results_plot(
-    pre_solver_metrics: dict[str, float],
-    post_solver_metrics: dict[str, float],
-    pre_proposer_metrics: dict[str, float],
-    post_proposer_metrics: dict[str, float],
-    log_history: list[dict[str, float]],
-) -> Path | None:
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib is not installed, skipping plot generation.")
-        return None
-
-    DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    plot_path = DEFAULT_OUTPUT_DIR / "debugzero_results.png"
-
-    figure, axes = plt.subplots(1, 2, figsize=(10, 4))
-
-    axes[0].bar(
-        ["solver pre", "solver post", "proposer pre", "proposer post"],
-        [
-            pre_solver_metrics["pass_rate"],
-            post_solver_metrics["pass_rate"],
-            pre_proposer_metrics["break_rate"],
-            post_proposer_metrics["break_rate"],
-        ],
-        color=["#4f81bd", "#4f81bd", "#c0504d", "#c0504d"],
-    )
-    axes[0].set_ylim(0.0, 1.0)
-    axes[0].set_title("Fixed Eval Rates")
-    axes[0].set_ylabel("Rate")
-
-    steps = [entry["step"] for entry in log_history if "step" in entry]
-    losses = [entry["loss"] for entry in log_history if "loss" in entry]
-    if steps and losses:
-        axes[1].plot(steps[: len(losses)], losses, marker="o")
-        axes[1].set_title("Training Loss")
-        axes[1].set_xlabel("Step")
-        axes[1].set_ylabel("Loss")
-    else:
-        axes[1].bar(
-            ["solver reward pre", "solver reward post"],
-            [
-                pre_solver_metrics["mean_reward"],
-                post_solver_metrics["mean_reward"],
-            ],
-            color=["#9bbb59", "#9bbb59"],
-        )
-        axes[1].set_title("Solver Mean Reward")
-
-    figure.tight_layout()
-    figure.savefig(plot_path)
-    plt.close(figure)
-    return plot_path
-
-
-def run_workflow(dry_run: bool = False) -> dict[str, object]:
-    dataset, bug_bank = create_dataset()
-    print(
-        f"Built dataset with {len(dataset)} rows from "
-        f"{len(bug_bank.train_samples)} training bugs and {len(bug_bank.eval_samples)} eval bugs."
-    )
-
-    model, tokenizer = load_training_model_and_tokenizer(dry_run, dataset, bug_bank)
-    trainer = create_trainer(model, tokenizer, dataset, dry_run)
-
+    # ── pre-eval ──────────────────────────────────────────────
+    print("\n--- Pre-training eval ---")
     reset_reward_history()
-    pre_solver_metrics = evaluate_solver_fixed_set(model, tokenizer, bug_bank)
-    pre_proposer_metrics = evaluate_proposer_fixed_set(model, tokenizer)
+    pre_s, pre_p = quick_eval(model, tokenizer, bug_bank)
+    print(f"  Solver  fix rate  : {pre_s:.0%}")
+    print(f"  Proposer bug rate : {pre_p:.0%}")
 
-    print("Pre-training solver metrics:", pre_solver_metrics)
-    print("Pre-training proposer metrics:", pre_proposer_metrics)
-
+    # ── train ─────────────────────────────────────────────────
+    print("\n--- Training ---")
     reset_reward_history()
-    train_result = trainer.train()
+    trainer.train()
 
-    post_solver_metrics = evaluate_solver_fixed_set(trainer.model, tokenizer, bug_bank)
-    post_proposer_metrics = evaluate_proposer_fixed_set(trainer.model, tokenizer)
+    # ── post-eval ─────────────────────────────────────────────
+    print("\n--- Post-training eval ---")
+    post_s, post_p = quick_eval(trainer.model, tokenizer, bug_bank)
+    print(f"  Solver  fix rate  : {post_s:.0%}  (delta {post_s - pre_s:+.0%})")
+    print(f"  Proposer bug rate : {post_p:.0%}  (delta {post_p - pre_p:+.0%})")
 
-    plot_path = save_results_plot(
-        pre_solver_metrics,
-        post_solver_metrics,
-        pre_proposer_metrics,
-        post_proposer_metrics,
-        trainer.state.log_history,
+    # Save merged weights (unsloth specific)
+    model.save_pretrained_merged(
+        args.output_dir + "/merged",
+        tokenizer,
+        save_method="merged_16bit",
     )
+    print(f"\nSaved to {args.output_dir}/merged")
 
-    results = {
-        "train_result": train_result,
-        "pre_solver_metrics": pre_solver_metrics,
-        "post_solver_metrics": post_solver_metrics,
-        "pre_proposer_metrics": pre_proposer_metrics,
-        "post_proposer_metrics": post_proposer_metrics,
-        "plot_path": str(plot_path) if plot_path else None,
-        "dataset_size": len(dataset),
-        "train_bug_count": len(bug_bank.train_samples),
-        "eval_bug_count": len(bug_bank.eval_samples),
+    return {
+        "pre_solver": pre_s,
+        "post_solver": post_s,
+        "pre_proposer": pre_p,
+        "post_proposer": post_p,
     }
 
-    print("Post-training solver metrics:", post_solver_metrics)
-    print("Post-training proposer metrics:", post_proposer_metrics)
-    if plot_path:
-        print(f"Saved plot to {plot_path}")
 
-    return results
+# ---------------------------------------------------------------------------
+# Step 8 — Dry run + entrypoint
+# ---------------------------------------------------------------------------
+def dry_run():
+    print("\n=== DRY RUN ===")
+    bug_bank = build_bug_bank()
+    ds = build_dataset(bug_bank)
+    print(f"Bug bank : {len(bug_bank.train_samples)} train / "
+          f"{len(bug_bank.eval_samples)} eval")
+    print(f"Dataset  : {len(ds)} rows")
 
+    # Test TRR++
+    rewards = [1.4, 0.0, 1.1, 0.0, 1.0, 0.0, 1.0, 0.0]
+    roles = ["proposer", "proposer", "proposer", "proposer",
+             "solver", "solver", "solver", "solver"]
+    normed = trr_plus_plus(rewards, roles)
+    print(f"\nTRR++ proposer in : {rewards[:4]}")
+    print(f"TRR++ proposer out: {[f'{x:.2f}' for x in normed[:4]]}")
+    print(f"TRR++ solver   in : {rewards[4:]}")
+    print(f"TRR++ solver   out: {[f'{x:.2f}' for x in normed[4:]]}")
 
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry_run", action="store_true", help="Run a tiny local GRPO smoke test.")
-    args = parser.parse_args()
-
-    run_workflow(dry_run=args.dry_run)
+    # Test reward fn on one real sample
+    samp = bug_bank.train_samples[0]
+    seed = get_seed_by_id(samp.seed_id)
+    result = execute_code(seed.original_code, seed.test)
+    r = compute_solver_reward({
+        "seed_id": seed.seed_id,
+        "tests_passed": result.passed,
+        "syntax_error": result.syntax_error,
+        "unsafe_code": False,
+    })
+    print(f"\nSolver reward (canonical as fix) : {r}  (expect 1.0)")
+    assert r == 1.0, f"Expected 1.0, got {r}"
+    print("\n=== DRY RUN PASSED ===")
 
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser(description="DebugZero GRPO training")
+    p.add_argument("--dry_run", action="store_true")
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--steps", type=int, default=DEFAULT_STEPS)
+    p.add_argument("--g", type=int, default=DEFAULT_G,
+                   help="num_generations (G rollouts per prompt, like AZR)")
+    p.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
+    p.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR)
+    args = p.parse_args()
+
+    if args.dry_run:
+        dry_run()
+    else:
+        train(args)
