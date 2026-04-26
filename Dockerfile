@@ -47,6 +47,7 @@ RUN apt-get update && \
 
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/env /app/env
+COPY --from=builder /app/env/README.md /app/README.md
 
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONPATH="/app/env:$PYTHONPATH"
