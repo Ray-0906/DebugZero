@@ -5,7 +5,7 @@ colorFrom: blue
 colorTo: indigo
 sdk: docker
 pinned: false
-app_port: 8000
+app_port: 7860
 base_path: /web
 tags:
   - openenv
@@ -24,6 +24,7 @@ tags:
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)]()
 [![License](https://img.shields.io/badge/License-BSD-green?style=for-the-badge)]()
 [![HuggingFace](https://img.shields.io/badge/🤗_Space-The--Fool--09%2FdebugZero-yellow?style=for-the-badge)](https://huggingface.co/spaces/The-Fool-09/debugZero)
+[![Colab](https://img.shields.io/badge/Colab-Training--Notebook-orange?style=for-the-badge&logo=google-colab)](./notebooks/train_colab_upate_1.ipynb)
 
 ---
 
@@ -51,6 +52,7 @@ tags:
 - [Future Work](#-future-work)
 - [How To Run](#-how-to-run)
 - [Repository Guide](#-repository-guide)
+- [Media & Writeup](#-media--writeup)
 - [Team](#-team)
 
 ---
@@ -283,15 +285,15 @@ DebugZero uses **8 AST-level mutation operators** implemented from scratch via P
 
 Each generated bug is scored for difficulty using a composite formula:
 
-$$D(\text{bug}) = w_{\text{op}} + \text{AST\_similarity}(\text{original}, \text{mutated}) + \min\!\left(\frac{\text{lines}_{\text{error}}}{4},\; 1.0\right)$$
+$$D(\text{bug}) = w_{\text{op}} + \mathrm{sim}_{\text{AST}}(\text{original}, \text{mutated}) + \min\!\left(\frac{L_{\text{error}}}{4},\; 1.0\right)$$
 
 Where:
 
 | Component | What It Measures | Range |
 |:---|:---|:---|
 | $w_{\text{op}}$ | Operator priority weight (higher = harder family) | 1–6 |
-| $\text{AST\_similarity}$ | How close the mutated AST is to the original | 0.0–1.0 |
-| $\text{lines}_{\text{error}}$ | Length of execution error output | 0–∞ |
+| $\mathrm{sim}_{\text{AST}}$ | How close the mutated AST is to the original | 0.0–1.0 |
+| $L_{\text{error}}$ | Length of execution error output | 0–∞ |
 
 **The hardest bugs are those that change very little in the code structure but produce diagnostic error messages that require careful reasoning to interpret.**
 
@@ -320,7 +322,7 @@ Where:
 
 **Plausibility Bonus** $\beta_{\text{plaus}}$ — Rewards bugs that look like realistic programmer mistakes, not random corruption:
 
-$$\beta_{\text{plaus}} = \text{AST\_distance}(\text{original},\;\text{mutated}) = \begin{cases} 1.0 & \text{if } \text{fuzz\_ratio} \geq 85\% \\ \max\!\left(0.1,\; \frac{\text{fuzz\_ratio} - 50}{35}\right) & \text{if } 50\% \leq \text{fuzz\_ratio} < 85\% \\ 0.0 & \text{if } \text{fuzz\_ratio} < 50\% \end{cases}$$
+$$\beta_{\text{plaus}} = \mathrm{dist}_{\text{AST}}(\text{original},\;\text{mutated}) = \begin{cases} 1.0 & \text{if fuzz ratio} \geq 85\% \\ \max\!\left(0.1,\; \frac{\text{fuzz ratio} - 50}{35}\right) & \text{if } 50\% \leq \text{fuzz ratio} < 85\% \\ 0.0 & \text{if fuzz ratio} < 50\% \end{cases}$$
 
 The plausibility score uses **Levenshtein-based AST similarity** (via `thefuzz`). A targeted single-node mutation typically scores 85–98% similarity → full bonus. Random wide corruption scores below 50% → zero bonus.
 
@@ -736,6 +738,23 @@ docker run -p 8000:8000 debugzero
 | [`models.py`](models.py) | Pydantic data models (Action, Observation, State) |
 | [`client.py`](client.py) | Environment client wrapper |
 | [`implementation.md`](implementation.md) | Detailed implementation guide |
+
+---
+
+## 🔗 Project Links
+
+- **Hugging Face Space**: [The-Fool-09/debugZero](https://huggingface.co/spaces/The-Fool-09/debugZero)
+- **GitHub Repository**: [The-Fool-09/debugZero](https://github.com/The-Fool-09/debugZero)
+
+---
+
+## 📽 Media & Writeup
+
+> [!IMPORTANT]  
+> **Final Submission Assets**
+> - **Mini-Blog / Writeup**: [📌 INSERT BLOG LINK HERE]
+> - **Demonstration Video**: [🎬 INSERT YOUTUBE LINK HERE]
+> - **Training Notebook**: [📓 train_colab_upate_1.ipynb](./notebooks/train_colab_upate_1.ipynb)
 
 ---
 
