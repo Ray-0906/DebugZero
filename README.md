@@ -333,7 +333,13 @@ Where:
 
 **Plausibility Bonus** $\beta_{\text{plaus}}$ — Rewards bugs that look like realistic programmer mistakes, not random corruption:
 
-$$\beta_{\text{plaus}} = \mathrm{dist}_{\text{AST}}(\text{original},\;\text{mutated}) = \begin{cases} 1.0 & \text{if fuzz ratio} \geq 85\% \\ \max\!\left(0.1,\; \frac{\text{fuzz ratio} - 50}{35}\right) & \text{if } 50\% \leq \text{fuzz ratio} \lt 85\% \\ 0.0 & \text{if fuzz ratio} \lt 50\% \end{cases}$$
+$$
+\beta_{\text{plaus}} = \mathrm{dist}_{\text{AST}}(\text{original},\;\text{mutated}) = \begin{cases}
+1.0 & \text{if fuzz ratio} \geq 85\% \\
+\max\!\left(0.1,\; \frac{\text{fuzz ratio} - 50}{35}\right) & \text{if } 50\% \leq \text{fuzz ratio} \lt 85\% \\
+0.0 & \text{if fuzz ratio} \lt 50\%
+\end{cases}
+$$
 
 The plausibility score uses **Levenshtein-based AST similarity** (via `thefuzz`). A targeted single-node mutation typically scores 85–98% similarity → full bonus. Random wide corruption scores below 50% → zero bonus.
 
