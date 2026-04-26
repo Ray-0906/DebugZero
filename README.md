@@ -33,6 +33,14 @@ tags:
 
 ---
 
+## Judge Materials
+
+- [Short project writeup](Blog.md)
+- [Hugging Face Space](https://the-fool-09-debugzero.hf.space)
+- [Training notebook](notebooks/train_colab_updated_1.ipynb)
+
+---
+
 ## 📋 Table of Contents
 
 - [Executive Summary](#-executive-summary)
