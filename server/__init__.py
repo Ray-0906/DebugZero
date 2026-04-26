@@ -7,5 +7,6 @@
 """Debugzero environment server components."""
 
 from .debugZero_environment import DebugzeroEnvironment
+from .tasks import HUMANEVAL_SEED, SEED_BANK, SeedSpec
 
-__all__ = ["DebugzeroEnvironment"]
+__all__ = ["DebugzeroEnvironment", "HUMANEVAL_SEED", "SEED_BANK", "SeedSpec"]

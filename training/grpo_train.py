@@ -88,6 +88,20 @@ def completion_to_text(completion) -> str:
     return str(completion)
 
 
+def prompt_to_text(prompt) -> str:
+    if isinstance(prompt, list):
+        parts = []
+        for item in prompt:
+            if isinstance(item, dict):
+                parts.append(str(item.get("content", "")))
+            else:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    if isinstance(prompt, dict):
+        return str(prompt.get("content", ""))
+    return str(prompt)
+
+
 def execute_candidate(seed: SeedSpec, candidate_code: str) -> dict[str, object]:
     result = execute_code(candidate_code, seed.test)
     execution_result = result.output[:500] if result.output else ""
@@ -584,7 +598,7 @@ def build_tiny_local_model_and_tokenizer(dataset: Dataset, bug_bank: BugBank):
     from tokenizers.trainers import WordLevelTrainer
     from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
-    corpus = [row["prompt"] for row in dataset]
+    corpus = [prompt_to_text(row["prompt"]) for row in dataset]
     corpus.extend(sample.original_code for sample in bug_bank.train_samples)
     corpus.extend(sample.buggy_code for sample in bug_bank.train_samples)
     corpus.extend(sample.original_code for sample in bug_bank.eval_samples)
@@ -605,6 +619,12 @@ def build_tiny_local_model_and_tokenizer(dataset: Dataset, bug_bank: BugBank):
         eos_token="<eos>",
         unk_token="<unk>",
         pad_token="<pad>",
+    )
+    tokenizer.chat_template = (
+        "{% for message in messages %}"
+        "{{ message['role'] }}: {{ message['content'] }}\n"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}assistant: {% endif %}"
     )
 
     model_config = GPT2Config(
@@ -633,24 +653,25 @@ def get_trl_classes():
 def create_trainer(model, tokenizer, dataset: Dataset, dry_run: bool):
     GRPOConfig, GRPOTrainer = get_trl_classes()
     profile = get_training_profile(dry_run)
-
-    training_args = GRPOConfig(
-        output_dir=str(DEFAULT_OUTPUT_DIR),
-        per_device_train_batch_size=profile["per_device_train_batch_size"],
-        gradient_accumulation_steps=profile["gradient_accumulation_steps"],
-        learning_rate=profile["learning_rate"],
-        max_steps=profile["max_steps"],
-        num_generations=profile["num_generations"],
-        max_prompt_length=DEFAULT_MAX_PROMPT_LENGTH,
-        max_completion_length=profile["max_completion_length"],
-        bf16=(not dry_run) and HAS_UNSLOTH and is_bfloat16_supported(),
-        fp16=(not dry_run) and not is_bfloat16_supported(),
-        use_cpu=dry_run,
-        logging_steps=1 if dry_run else 5,
-        optim=profile["optim"],
-        report_to=profile["report_to"],
-        disable_tqdm=True,
-    )
+    supported_kwargs = importlib.import_module("inspect").signature(GRPOConfig.__init__).parameters
+    config_kwargs = {
+        "output_dir": str(DEFAULT_OUTPUT_DIR),
+        "per_device_train_batch_size": profile["per_device_train_batch_size"],
+        "gradient_accumulation_steps": profile["gradient_accumulation_steps"],
+        "learning_rate": profile["learning_rate"],
+        "max_steps": profile["max_steps"],
+        "num_generations": profile["num_generations"],
+        "max_prompt_length": DEFAULT_MAX_PROMPT_LENGTH,
+        "max_completion_length": profile["max_completion_length"],
+        "bf16": (not dry_run) and HAS_UNSLOTH and is_bfloat16_supported(),
+        "fp16": (not dry_run) and not is_bfloat16_supported(),
+        "use_cpu": dry_run,
+        "logging_steps": 1 if dry_run else 5,
+        "optim": profile["optim"],
+        "report_to": profile["report_to"],
+        "disable_tqdm": True,
+    }
+    training_args = GRPOConfig(**{k: v for k, v in config_kwargs.items() if k in supported_kwargs})
 
     print(f"Starting GRPO training for {training_args.max_steps} episodes (steps)...")
     print("To change the number of episodes, modify 'max_steps' in the training profile.")

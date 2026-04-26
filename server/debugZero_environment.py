@@ -16,10 +16,10 @@ from openenv.core.env_server.interfaces import Environment
 
 try:
     from ..models import DebugzeroAction, DebugzeroObservation, DebugzeroState
-    from ..seed_bank import HUMANEVAL_SEED, SEED_BANK, SeedSpec
+    from .tasks import SEED_BANK, SeedSpec
 except ImportError:
     from models import DebugzeroAction, DebugzeroObservation, DebugzeroState
-    from seed_bank import HUMANEVAL_SEED, SEED_BANK, SeedSpec
+    from server.tasks import SEED_BANK, SeedSpec
 
 try:
     from .executor import execute_code
