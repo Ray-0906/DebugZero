@@ -53,7 +53,7 @@ app = create_app(
     DebugzeroAction,
     DebugzeroObservation,
     env_name="debugZero",
-    max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
+    max_concurrent_envs=10,  # increase this number to allow more concurrent WebSocket sessions
 )
 
 
