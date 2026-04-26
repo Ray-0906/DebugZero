@@ -24,7 +24,7 @@ tags:
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)]()
 [![License](https://img.shields.io/badge/License-BSD-green?style=for-the-badge)]()
 [![HuggingFace](https://img.shields.io/badge/🤗_Space-The--Fool--09%2FdebugZero-yellow?style=for-the-badge)](https://huggingface.co/spaces/The-Fool-09/debugZero)
-[![Colab](https://img.shields.io/badge/Colab-Training--Notebook-orange?style=for-the-badge&logo=google-colab)](./notebooks/train_colab_upate_1.ipynb)
+[![Colab](https://img.shields.io/badge/Colab-Training--Notebook-orange?style=for-the-badge&logo=google-colab)](./MAIN_TRAINING_NOTEBOOK/train_colab_upate_1.ipynb)
 
 ---
 
@@ -36,9 +36,12 @@ tags:
 
 ## Judge Materials
 
-- [Short project writeup](Blog.md)
+> [!IMPORTANT]
+> **Dear Judges:** The final training notebook that demonstrates our training results and execution is located in the `MAIN_TRAINING_NOTEBOOK/` directory. Please run this notebook to observe our full training process and the final performance of the DebugZero environment.
+
+- [LINK TO BLOG](Blog.md)
 - [Hugging Face Space](https://the-fool-09-debugzero.hf.space)
-- [Training notebook](notebooks/train_colab_updated_1.ipynb)
+- [Training notebook](MAIN_TRAINING_NOTEBOOK/train_colab_updated_1.ipynb)
 
 ---
 
@@ -762,7 +765,7 @@ docker run -p 8000:8000 debugzero
 > **Final Submission Assets**
 > - **Mini-Blog / Writeup**: [📌 INSERT BLOG LINK HERE]
 > - **Demonstration Video**: [🎬 INSERT YOUTUBE LINK HERE]
-> - **Training Notebook**: [📓 train_colab_upate_1.ipynb](./notebooks/train_colab_upate_1.ipynb)
+> - **Training Notebook**: [📓 train_colab_upate_1.ipynb](./MAIN_TRAINING_NOTEBOOK/train_colab_upate_1.ipynb)
 
 ---
 
