@@ -131,6 +131,88 @@ SEED_BANK = (
             "check(running_max)\n"
         ),
     ),
+    SeedSpec(
+        seed_id="DebugZero/6",
+        entrypoint="first_index_of",
+        prompt="def first_index_of(values: list[int], target: int) -> int:",
+        canonical_solution=(
+            "    for idx, value in enumerate(values):\n"
+            "        if value == target:\n"
+            "            return idx\n"
+            "    return -1\n"
+        ),
+        test=(
+            "def check(candidate):\n"
+            "    assert candidate([], 3) == -1\n"
+            "    assert candidate([1, 2, 3], 1) == 0\n"
+            "    assert candidate([1, 2, 3], 3) == 2\n"
+            "    assert candidate([5, 7, 5, 7], 7) == 1\n"
+            "    assert candidate([9, 8], 4) == -1\n\n"
+            "check(first_index_of)\n"
+        ),
+    ),
+    SeedSpec(
+        seed_id="DebugZero/7",
+        entrypoint="drop_last",
+        prompt="def drop_last(values: list[int]) -> list[int]:",
+        canonical_solution=(
+            "    if not values:\n"
+            "        return []\n"
+            "    return values[:-1]\n"
+        ),
+        test=(
+            "def check(candidate):\n"
+            "    assert candidate([]) == []\n"
+            "    assert candidate([1]) == []\n"
+            "    assert candidate([1, 2]) == [1]\n"
+            "    assert candidate([1, 2, 3, 4]) == [1, 2, 3]\n"
+            "    assert candidate([7, 7, 7]) == [7, 7]\n\n"
+            "check(drop_last)\n"
+        ),
+    ),
+    SeedSpec(
+        seed_id="DebugZero/8",
+        entrypoint="count_greater_than",
+        prompt="def count_greater_than(values: list[int], threshold: int) -> int:",
+        canonical_solution=(
+            "    total = 0\n"
+            "    for value in values:\n"
+            "        if value > threshold:\n"
+            "            total += 1\n"
+            "    return total\n"
+        ),
+        test=(
+            "def check(candidate):\n"
+            "    assert candidate([], 1) == 0\n"
+            "    assert candidate([1, 2, 3], 2) == 1\n"
+            "    assert candidate([4, 5, 6], 3) == 3\n"
+            "    assert candidate([0, -1, 2, 2], 1) == 2\n"
+            "    assert candidate([5, 5, 5], 5) == 0\n\n"
+            "check(count_greater_than)\n"
+        ),
+    ),
+    SeedSpec(
+        seed_id="DebugZero/9",
+        entrypoint="prefix_sums",
+        prompt="def prefix_sums(values: list[int]) -> list[int]:",
+        canonical_solution=(
+            "    total = 0\n"
+            "    result = []\n"
+            "    for value in values:\n"
+            "        total += value\n"
+            "        result.append(total)\n"
+            "    return result\n"
+        ),
+        test=(
+            "def check(candidate):\n"
+            "    assert candidate([]) == []\n"
+            "    assert candidate([3]) == [3]\n"
+            "    assert candidate([1, 2, 3]) == [1, 3, 6]\n"
+            "    assert candidate([2, -1, 4]) == [2, 1, 5]\n"
+            "    assert candidate([0, 0, 0]) == [0, 0, 0]\n\n"
+            "check(prefix_sums)\n"
+        ),
+    ),
 )
 
 SEED_BY_ID = {seed.seed_id: seed for seed in SEED_BANK}
