@@ -8,6 +8,7 @@ seed_bank.py
 ./__init__.py
 ./bug_bank.py
 ./client.py
+./inference.py
 ./models.py
 ./seed_bank.py
 openenv_debugZero.egg-info/PKG-INFO
@@ -21,4 +22,5 @@ server/app.py
 server/bug_injector.py
 server/debugZero_environment.py
 server/executor.py
-server/rewards.py
+server/graders.py
+server/tasks.py
