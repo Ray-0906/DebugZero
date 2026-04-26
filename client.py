@@ -73,21 +73,24 @@ class DebugzeroEnv(
             StepResult with DebugzeroObservation
         """
         obs_data = payload.get("observation", {})
+        reward_value = payload.get("reward", obs_data.get("reward"))
+        done_value = payload.get("done", obs_data.get("done", False))
         observation = DebugzeroObservation(
             role_next=obs_data.get("role_next", "proposer"),
             current_code=obs_data.get("current_code", ""),
             execution_result=obs_data.get("execution_result", ""),
             tests_passed=obs_data.get("tests_passed", False),
             syntax_error=obs_data.get("syntax_error", False),
-            done=payload.get("done", False),
-            reward=payload.get("reward"),
+            score=obs_data.get("score", 0.0),
+            done=done_value,
+            reward=reward_value,
             metadata=obs_data.get("metadata", {}),
         )
 
         return StepResult(
             observation=observation,
-            reward=payload.get("reward"),
-            done=payload.get("done", False),
+            reward=reward_value,
+            done=done_value,
         )
 
     def _parse_state(self, payload: Dict) -> DebugzeroState:

@@ -30,6 +30,7 @@ class DebugzeroObservation(Observation):
     execution_result: str = Field(default="", description="Result of evaluating tests in the sandbox")
     tests_passed: bool = Field(default=False, description="Whether the tests passed")
     syntax_error: bool = Field(default=False, description="Whether the code had a parse/syntax error")
+    score: float = Field(default=0.0, description="Episode progress score in the range [0.0, 1.0]")
 
 class DebugzeroState(State):
     """State for the DebugZero environment, extending default state with seed context."""

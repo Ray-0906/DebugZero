@@ -2,8 +2,8 @@ import asyncio
 import inspect
 import json
 import os
-import re
 import sys
+import textwrap
 from typing import Any, List, Optional
 
 from dotenv import load_dotenv
@@ -11,14 +11,6 @@ from openai import OpenAI
 
 from client import DebugzeroEnv
 from models import DebugzeroAction
-from server.graders import (
-    compute_ast_distance,
-    compute_proposer_reward,
-    compute_solver_reward,
-    is_effectively_unchanged,
-    reset_reward_history,
-)
-from training.dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
 
 load_dotenv()
 
@@ -35,18 +27,18 @@ BUG_FOCUS = os.getenv("DEBUGZERO_BUG_FOCUS")
 
 NUM_EPISODES = int(os.getenv("NUM_EPISODES", "3"))
 MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
-MAX_PROPOSER_STEPS = int(os.getenv("MAX_PROPOSER_STEPS", str(max(1, MAX_STEPS // 2))))
-MAX_SOLVER_STEPS = int(os.getenv("MAX_SOLVER_STEPS", str(max(1, MAX_STEPS - MAX_PROPOSER_STEPS))))
 PROPOSER_TEMPERATURE = float(os.getenv("PROPOSER_TEMPERATURE", "0.7"))
 SOLVER_TEMPERATURE = float(os.getenv("SOLVER_TEMPERATURE", "0.2"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1024"))
 
 
 def extract_python_code(text: str) -> str:
-    match = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return text.strip()
+    content = (text or "").strip()
+    if content.startswith("```"):
+        content = content.split("\n", 1)[-1]
+    if content.endswith("```"):
+        content = content.rsplit("\n", 1)[0]
+    return content.strip()
 
 
 def compact_action_string(role: str, code: str) -> str:
@@ -84,69 +76,108 @@ def summarize_error(text: str, max_chars: int = 220) -> str:
     return cleaned[: max_chars - 3].rstrip() + "..."
 
 
-def extract_env_error(observation: Any) -> Optional[str]:
-    execution_result = getattr(observation, "execution_result", "") or ""
-    if not execution_result:
+def extract_env_error(result: Any) -> Optional[str]:
+    for attr in ("last_action_error", "error", "message"):
+        if hasattr(result, attr):
+            value = getattr(result, attr)
+            if value:
+                return str(value)
+
+    obs = getattr(result, "observation", None)
+    if obs is None:
         return None
-    if getattr(observation, "syntax_error", False):
-        return summarize_error(execution_result)
-    if execution_result.startswith("Unsafe import detected."):
-        return execution_result
-    if not getattr(observation, "tests_passed", False):
-        return summarize_error(execution_result)
+
+    for attr in ("last_action_error", "error"):
+        if hasattr(obs, attr):
+            value = getattr(obs, attr)
+            if value:
+                return str(value)
+
+    execution_result = getattr(obs, "execution_result", "")
+    if isinstance(execution_result, str) and execution_result:
+        if getattr(obs, "syntax_error", False):
+            return summarize_error(execution_result)
+        if execution_result.startswith("Unsafe import detected."):
+            return execution_result
+        if not getattr(obs, "tests_passed", False):
+            return summarize_error(execution_result)
+
     return None
 
 
-def classify_proposer_attempt(
-    original_code: str,
-    candidate_code: str,
-    *,
-    tests_passed: bool,
-    syntax_error: bool,
-) -> dict[str, bool]:
-    unchanged_code = is_effectively_unchanged(original_code, candidate_code)
-    valid_bug = (not tests_passed) and (not syntax_error)
-    changed_but_passing = (not unchanged_code) and tests_passed and (not syntax_error)
-    return {
-        "unchanged_code": unchanged_code,
-        "valid_bug": valid_bug,
-        "changed_but_passing": changed_but_passing,
-    }
+def build_prompt(obs_dict: dict[str, Any], history: List[str]) -> str:
+    role = str(obs_dict.get("role_next", "proposer"))
+    current_code = str(obs_dict.get("current_code", ""))
+    execution_result = str(obs_dict.get("execution_result", ""))
+    tests_passed = bool(obs_dict.get("tests_passed", False))
+    syntax_error = bool(obs_dict.get("syntax_error", False))
+    metadata = obs_dict.get("metadata", {}) or {}
+    seed_id = metadata.get("seed_id", "unknown")
+    history_block = "\n".join(history[-4:]) if history else "None"
 
-
-def clamp_score(score: float) -> float:
-    return max(0.0001, min(0.9999, float(score)))
-
-
-async def maybe_await(value: Any) -> Any:
-    if inspect.isawaitable(value):
-        return await value
-    return value
-
-
-async def call_env_method(obj: Any, method_name: str, *args: Any) -> Any:
-    method = getattr(obj, method_name)
-    result = method(*args)
-    return await maybe_await(result)
-
-
-def get_model_code(
-    client: OpenAI,
-    *,
-    role: str,
-    current_code: str,
-    execution_result: str,
-    feedback: str,
-) -> str:
     if role == "proposer":
-        prompt = sample_proposer_prompt(current_code, bug_focus=BUG_FOCUS)
-        temperature = PROPOSER_TEMPERATURE
-    else:
-        prompt = sample_solver_prompt(current_code, execution_result, mode="concise")
-        temperature = SOLVER_TEMPERATURE
+        focus_line = ""
+        if BUG_FOCUS:
+            focus_line = f"- Focus specifically on the `{BUG_FOCUS}` mutation family.\n"
+        task_block = textwrap.dedent(
+            f"""
+            You are the Proposer in a debugging self-play environment.
+            Return a full Python function with exactly one small logical bug injected.
 
-    if feedback:
-        prompt = f"{feedback}\n\n{prompt}"
+            Rules:
+            - Keep the code valid Python.
+            - Keep the same function signature.
+            - Preserve the overall structure and formatting as much as possible.
+            - Make exactly one small local behavioral change.
+            - Avoid comments, explanations, markdown outside the code block, and broad rewrites.
+            {focus_line}- Your goal is to make tests fail without creating a syntax error.
+            """
+        ).strip()
+    else:
+        task_block = textwrap.dedent(
+            """
+            You are the Solver in a debugging self-play environment.
+            Return the full fixed Python function.
+
+            Rules:
+            - Keep the code valid Python.
+            - Keep the same function signature.
+            - Make the smallest correct local fix you can.
+            - Use the failure output to guide the repair.
+            - Avoid comments, explanations, markdown outside the code block, and unrelated refactors.
+            """
+        ).strip()
+
+    return textwrap.dedent(
+        f"""
+        {task_block}
+
+        Current environment state:
+        - seed_id: {seed_id}
+        - role_next: {role}
+        - tests_passed: {tests_passed}
+        - syntax_error: {syntax_error}
+
+        Current code:
+        ```python
+        {current_code}
+        ```
+
+        Execution result:
+        {execution_result if execution_result else "None"}
+
+        Previous actions:
+        {history_block}
+
+        Return only the full Python code inside triple backticks.
+        """
+    ).strip()
+
+
+def get_model_code(client: OpenAI, obs_dict: dict[str, Any], history: List[str]) -> str:
+    role = str(obs_dict.get("role_next", "proposer"))
+    prompt = build_prompt(obs_dict, history)
+    temperature = PROPOSER_TEMPERATURE if role == "proposer" else SOLVER_TEMPERATURE
 
     response = client.chat.completions.create(
         model=MODEL_NAME,
@@ -159,6 +190,18 @@ def get_model_code(
     )
 
     return extract_python_code(response.choices[0].message.content or "")
+
+
+async def maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def call_env_method(obj: Any, method_name: str, *args: Any) -> Any:
+    method = getattr(obj, method_name)
+    result = method(*args)
+    return await maybe_await(result)
 
 
 async def make_env() -> Any:
@@ -205,152 +248,67 @@ async def main() -> None:
 
     try:
         env = await make_env()
-        reset_reward_history()
 
         for _episode in range(1, NUM_EPISODES + 1):
+            history: List[str] = []
             rewards: List[float] = []
             steps_taken = 0
-            proposer_feedback = ""
-            solver_feedback = ""
-            proposer_succeeded = False
+            score = 0.0
             success = False
-            score = 0.0001
 
             log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
 
             try:
                 result = await call_env_method(env, "reset")
-                obs = result.observation
-                original_code = obs.metadata.get("original_code", obs.current_code)
+                done = bool(getattr(result, "done", False))
+                obs = getattr(result, "observation", None)
 
-                for _proposer_step in range(1, MAX_PROPOSER_STEPS + 1):
-                    if steps_taken >= MAX_STEPS:
+                for step in range(1, MAX_STEPS + 1):
+                    if done or obs is None:
                         break
-                    steps_taken += 1
+
+                    obs_dict = obs.model_dump() if hasattr(obs, "model_dump") else obs.dict()
+                    role = str(obs_dict.get("role_next", "proposer"))
 
                     try:
-                        proposer_code = await asyncio.to_thread(
-                            get_model_code,
-                            client,
-                            role="proposer",
-                            current_code=obs.current_code,
-                            execution_result=obs.execution_result,
-                            feedback=proposer_feedback,
-                        )
+                        code = await asyncio.to_thread(get_model_code, client, obs_dict, history)
+                        env_action = DebugzeroAction(role=role, code=code)
+                        action_str = compact_action_string(role, code)
                     except Exception as exc:
-                        print(f"[SYSTEM ERROR] Proposer generation failed: {exc}", file=sys.stderr, flush=True)
-                        proposer_code = obs.current_code
+                        print(f"[SYSTEM ERROR] Model generation failed: {exc}", file=sys.stderr, flush=True)
+                        code = obs_dict.get("current_code", "")
+                        env_action = DebugzeroAction(role=role, code=code)
+                        action_str = compact_action_string(role, code)
 
-                    action = DebugzeroAction(role="proposer", code=proposer_code)
-                    result = await call_env_method(env, "step", action)
-                    obs = result.observation
+                    result = await call_env_method(env, "step", env_action)
+                    obs = getattr(result, "observation", None)
+                    done = bool(getattr(result, "done", False))
+                    reward = float(getattr(result, "reward", 0.0) or 0.0)
 
-                    proposer_attempt = classify_proposer_attempt(
-                        original_code,
-                        proposer_code,
-                        tests_passed=obs.tests_passed,
-                        syntax_error=obs.syntax_error,
-                    )
-
-                    reward = compute_proposer_reward(
-                        {
-                            "seed_id": obs.metadata.get("seed_id", ""),
-                            "tests_passed": obs.tests_passed,
-                            "syntax_error": obs.syntax_error,
-                            "unsafe_code": obs.execution_result.startswith("Unsafe import detected."),
-                            "unchanged_code": proposer_attempt["unchanged_code"],
-                            "changed_but_passing": proposer_attempt["changed_but_passing"],
-                            "plausibility_score": 0.0
-                            if obs.syntax_error
-                            else compute_ast_distance(original_code, proposer_code),
-                        }
-                    )
                     rewards.append(reward)
+                    steps_taken = step
 
-                    log_step(
-                        step=steps_taken,
-                        action=compact_action_string("proposer", proposer_code),
-                        reward=reward,
-                        done=bool(getattr(result, "done", False)),
-                        error=extract_env_error(obs),
-                    )
+                    error = extract_env_error(result)
 
-                    if obs.syntax_error:
-                        proposer_feedback = (
-                            "Your last attempt caused a syntax error. Keep the code valid and preserve the signature."
-                        )
-                    elif proposer_attempt["valid_bug"]:
-                        proposer_succeeded = True
-                        score = 0.5000
-                        break
-                    elif proposer_attempt["unchanged_code"]:
-                        proposer_feedback = (
-                            "Your last attempt did not change behavior. Make exactly one small boundary, "
-                            "comparison, condition, or slice bug."
-                        )
-                    else:
-                        proposer_feedback = (
-                            "The tests still passed. Keep exactly one small local edit, but make it "
-                            "behavior-changing."
-                        )
-
-                if proposer_succeeded:
-                    for _solver_step in range(1, MAX_SOLVER_STEPS + 1):
-                        if steps_taken >= MAX_STEPS:
-                            break
-                        steps_taken += 1
-
-                        try:
-                            solver_code = await asyncio.to_thread(
-                                get_model_code,
-                                client,
-                                role="solver",
-                                current_code=obs.current_code,
-                                execution_result=obs.execution_result,
-                                feedback=solver_feedback,
-                            )
-                        except Exception as exc:
-                            print(f"[SYSTEM ERROR] Solver generation failed: {exc}", file=sys.stderr, flush=True)
-                            solver_code = obs.current_code
-
-                        action = DebugzeroAction(role="solver", code=solver_code)
-                        result = await call_env_method(env, "step", action)
-                        obs = result.observation
-
-                        reward = compute_solver_reward(
-                            {
-                                "seed_id": obs.metadata.get("seed_id", ""),
-                                "tests_passed": obs.tests_passed,
-                                "syntax_error": obs.syntax_error,
-                                "unsafe_code": obs.execution_result.startswith("Unsafe import detected."),
-                            }
-                        )
-                        rewards.append(reward)
-
-                        log_step(
-                            step=steps_taken,
-                            action=compact_action_string("solver", solver_code),
-                            reward=reward,
-                            done=bool(getattr(result, "done", False)),
-                            error=extract_env_error(obs),
-                        )
-
-                        if obs.syntax_error:
-                            solver_feedback = "The fix caused a syntax error. Return a valid full function."
-                        elif obs.tests_passed:
-                            success = True
-                            score = 0.9999
-                            break
-                        else:
-                            solver_feedback = (
-                                "The bug is still present. Focus on the failing behavior in the traceback."
+                    if obs is not None:
+                        score = float(getattr(obs, "score", score) or score)
+                        if done:
+                            success = bool(getattr(obs, "tests_passed", False)) and not bool(
+                                getattr(obs, "syntax_error", False)
                             )
 
-                log_end(success=success, steps=steps_taken, score=clamp_score(score), rewards=rewards)
+                    score = max(0.0001, min(0.9999, score))
+                    log_step(step=step, action=action_str, reward=reward, done=done, error=error)
+
+                    history.append(f"Step {step}: {action_str} -> reward {reward:.2f}")
+
+                score = max(0.0001, min(0.9999, float(score)))
 
             except Exception as exc:
                 print(f"[SYSTEM ERROR] {exc}", file=sys.stderr, flush=True)
-                log_end(success=False, steps=steps_taken, score=clamp_score(score), rewards=rewards)
+                success = False
+            finally:
+                log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
     except Exception as exc:
         print(f"[SYSTEM ERROR] {exc}", file=sys.stderr, flush=True)

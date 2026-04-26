@@ -1,142 +1,241 @@
+import asyncio
+import inspect
+import json
 import os
-import re
 import sys
+import textwrap
+from typing import Any, Optional
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from bug_bank import build_bug_bank
+from dotenv import load_dotenv
+from openai import OpenAI
+
+from client import DebugzeroEnv
 from models import DebugzeroAction
-from seed_bank import SEED_BANK, get_seed_by_id
-from server.bug_injector import infer_bug_operator
-from server.executor import execute_code
-from server.graders import (
-    compute_ast_distance,
-    compute_proposer_reward,
-    compute_solver_reward,
-    is_effectively_unchanged,
-    reset_reward_history,
-)
-from training.dual_role_sampler import sample_proposer_prompt, sample_solver_prompt
+
+load_dotenv()
+
+
+API_BASE_URL = os.getenv("API_BASE_URL") or os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+MODEL_NAME = os.getenv("MODEL_NAME") or os.getenv("OPENAI_MODEL", "meta-llama/llama-3.1-8b-instruct")
+API_KEY = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("HF_TOKEN")
+ENV_URL = os.getenv("DEBUGZERO_ENV_URL", "http://localhost:8000")
+
+NUM_EPISODES = int(os.getenv("NUM_EPISODES", "6"))
+MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
+PROPOSER_TEMPERATURE = float(os.getenv("PROPOSER_TEMPERATURE", "0.7"))
+SOLVER_TEMPERATURE = float(os.getenv("SOLVER_TEMPERATURE", "0.2"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1024"))
+BUG_FOCUS = os.getenv("DEBUGZERO_BUG_FOCUS")
 
 
 def extract_python_code(text: str) -> str:
-    match = re.search(r"```(?:python)?\s(.*?)```", text, flags=re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return text.strip()
+    content = (text or "").strip()
+    if content.startswith("```"):
+        content = content.split("\n", 1)[-1]
+    if content.endswith("```"):
+        content = content.rsplit("\n", 1)[0]
+    return content.strip()
 
 
-def execute_candidate(seed_id: str, code: str) -> dict[str, object]:
-    seed = get_seed_by_id(seed_id)
-    result = execute_code(code, seed.test)
-    execution_result = result.output[:500] if result.output else ""
-    return {
-        "tests_passed": result.passed,
-        "syntax_error": result.syntax_error,
-        "unsafe_code": execution_result.startswith("Unsafe import detected."),
-        "execution_result": execution_result,
-    }
+def summarize_error(text: str, max_chars: int = 220) -> str:
+    cleaned = " ".join(text.strip().split())
+    if not cleaned:
+        return "null"
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3].rstrip() + "..."
 
 
-def classify_proposer_attempt(
-    original_code: str,
-    candidate_code: str,
-    *,
-    tests_passed: bool,
-    syntax_error: bool,
-) -> dict[str, bool]:
-    unchanged_code = is_effectively_unchanged(original_code, candidate_code)
-    valid_bug = (not tests_passed) and (not syntax_error)
-    changed_but_passing = (not unchanged_code) and tests_passed and (not syntax_error)
-    return {
-        "unchanged_code": unchanged_code,
-        "valid_bug": valid_bug,
-        "changed_but_passing": changed_but_passing,
-    }
+def extract_env_error(result: Any) -> Optional[str]:
+    for attr in ("last_action_error", "error", "message"):
+        if hasattr(result, attr):
+            value = getattr(result, attr)
+            if value:
+                return str(value)
 
-
-def run_deterministic_controls() -> dict[str, object]:
-    bug_bank = build_bug_bank()
-    controls = []
-
-    print("=" * 80)
-    print("Deterministic controls")
-    print("=" * 80)
-
-    for seed in SEED_BANK:
-        eval_bug = next(sample for sample in bug_bank.eval_samples if sample.seed_id == seed.seed_id)
-        canonical_result = execute_candidate(seed.seed_id, seed.original_code)
-        buggy_result = execute_candidate(seed.seed_id, eval_bug.buggy_code)
-        syntax_result = execute_candidate(seed.seed_id, "def broken(: pass")
-
-        controls.append(
-            {
-                "seed_id": seed.seed_id,
-                "canonical_passes": canonical_result["tests_passed"] and not canonical_result["syntax_error"],
-                "bug_fails": (not buggy_result["tests_passed"]) and not buggy_result["syntax_error"],
-                "syntax_detected": syntax_result["syntax_error"],
-            }
-        )
-
-    canonical_passes = sum(1 for item in controls if item["canonical_passes"])
-    bug_failures = sum(1 for item in controls if item["bug_fails"])
-    syntax_detected = sum(1 for item in controls if item["syntax_detected"])
-
-    summary = {
-        "seed_count": len(SEED_BANK),
-        "canonical_pass_count": canonical_passes,
-        "verified_bug_fail_count": bug_failures,
-        "syntax_detect_count": syntax_detected,
-        "controls": controls,
-        "bug_bank": bug_bank,
-    }
-
-    print(f"Canonical pass count: {canonical_passes}/{len(SEED_BANK)}")
-    print(f"Verified bug fail count: {bug_failures}/{len(SEED_BANK)}")
-    print(f"Syntax detection count: {syntax_detected}/{len(SEED_BANK)}")
-    return summary
-
-
-async def run_live_api_probe(bug_bank) -> dict[str, object] | None:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    base_url = os.environ.get("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
-    model_name = os.environ.get("OPENAI_MODEL")
-    env_url = os.environ.get("DEBUGZERO_ENV_URL", "http://localhost:8000")
-
-    if not api_key:
-        print("Skipping live API probe: OPENAI_API_KEY is not set.")
-        return None
-    if not model_name:
-        print("Skipping live API probe: OPENAI_MODEL is not set.")
+    obs = getattr(result, "observation", None)
+    if obs is None:
         return None
 
-    from openai import OpenAI
-    from client import DebugzeroEnv
+    for attr in ("last_action_error", "error"):
+        if hasattr(obs, attr):
+            value = getattr(obs, attr)
+            if value:
+                return str(value)
 
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    env = DebugzeroEnv(base_url=env_url)
+    execution_result = getattr(obs, "execution_result", "")
+    if isinstance(execution_result, str) and execution_result:
+        if getattr(obs, "syntax_error", False):
+            return summarize_error(execution_result)
+        if execution_result.startswith("Unsafe import detected."):
+            return execution_result
+        if not getattr(obs, "tests_passed", False):
+            return summarize_error(execution_result)
 
-    reset_reward_history()
-    proposer_feedback = ""
-    solver_feedback = ""
+    return None
+
+
+def compact_action_string(role: str, code: str) -> str:
+    return json.dumps({"role": role, "code": code}, separators=(",", ":"), ensure_ascii=False)
+
+
+def build_prompt(obs_dict: dict[str, Any], history: list[str]) -> str:
+    role = str(obs_dict.get("role_next", "proposer"))
+    current_code = str(obs_dict.get("current_code", ""))
+    execution_result = str(obs_dict.get("execution_result", ""))
+    tests_passed = bool(obs_dict.get("tests_passed", False))
+    syntax_error = bool(obs_dict.get("syntax_error", False))
+    metadata = obs_dict.get("metadata", {}) or {}
+    seed_id = metadata.get("seed_id", "unknown")
+    history_block = "\n".join(history[-4:]) if history else "None"
+
+    if role == "proposer":
+        focus_line = ""
+        if BUG_FOCUS:
+            focus_line = f"- Focus specifically on the `{BUG_FOCUS}` mutation family.\n"
+        instructions = textwrap.dedent(
+            f"""
+            You are the Proposer in a debugging self-play environment.
+            Return a full Python function with exactly one small logical bug injected.
+
+            Rules:
+            - Keep the code valid Python.
+            - Keep the same function signature.
+            - Preserve the overall structure and formatting as much as possible.
+            - Make exactly one small local behavioral change.
+            - Avoid comments, explanations, markdown outside the code block, and broad rewrites.
+            {focus_line}- Your goal is to make tests fail without creating a syntax error.
+            """
+        ).strip()
+    else:
+        instructions = textwrap.dedent(
+            """
+            You are the Solver in a debugging self-play environment.
+            Return the full fixed Python function.
+
+            Rules:
+            - Keep the code valid Python.
+            - Keep the same function signature.
+            - Make the smallest correct local fix you can.
+            - Use the failure output to guide the repair.
+            - Avoid comments, explanations, markdown outside the code block, and unrelated refactors.
+            """
+        ).strip()
+
+    return textwrap.dedent(
+        f"""
+        {instructions}
+
+        Current environment state:
+        - seed_id: {seed_id}
+        - role_next: {role}
+        - tests_passed: {tests_passed}
+        - syntax_error: {syntax_error}
+
+        Current code:
+        ```python
+        {current_code}
+        ```
+
+        Execution result:
+        {execution_result if execution_result else "None"}
+
+        Previous actions:
+        {history_block}
+
+        Return only the full Python code inside triple backticks.
+        """
+    ).strip()
+
+
+def get_model_code(client: OpenAI, obs_dict: dict[str, Any], history: list[str]) -> str:
+    role = str(obs_dict.get("role_next", "proposer"))
+    prompt = build_prompt(obs_dict, history)
+    temperature = PROPOSER_TEMPERATURE if role == "proposer" else SOLVER_TEMPERATURE
+
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You are an expert Python coder."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=temperature,
+        max_tokens=MAX_TOKENS,
+    )
+
+    return extract_python_code(response.choices[0].message.content or "")
+
+
+async def maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def call_env_method(obj: Any, method_name: str, *args: Any) -> Any:
+    method = getattr(obj, method_name)
+    result = method(*args)
+    return await maybe_await(result)
+
+
+async def make_env() -> Any:
+    max_retries = 30
+    for attempt in range(max_retries):
+        try:
+            return DebugzeroEnv(base_url=ENV_URL)
+        except Exception as exc:
+            print(
+                f"[SYSTEM ERROR] Env connection to {ENV_URL} failed (attempt {attempt + 1}/{max_retries}): {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if attempt < max_retries - 1:
+                await asyncio.sleep(5.0)
+            else:
+                raise
+
+
+def print_live_summary(metrics: dict[str, Any]) -> None:
+    episodes = max(1, int(metrics["episodes"]))
+    proposer_attempts = max(1, int(metrics["proposer_attempts"]))
+    solver_attempts = max(1, int(metrics["solver_attempts"]))
+    rewards = metrics["rewards"]
+    average_reward = (sum(rewards) / len(rewards)) if rewards else 0.0
+
+    print("\n" + "=" * 80)
+    print("Live API summary")
+    print("=" * 80)
+    print(f"Episode success rate:  {metrics['episode_successes'] / episodes:.2%}")
+    print(f"Proposer syntax rate:  {metrics['proposer_syntax_errors'] / proposer_attempts:.2%}")
+    print(f"Solver syntax rate:    {metrics['solver_syntax_errors'] / solver_attempts:.2%}")
+    print(f"Average step reward:   {average_reward:.2f}")
+    print(f"Average steps/episode: {metrics['total_steps'] / episodes:.2f}")
+    print(f"Representative success: {metrics['representative_success']}")
+    print(f"Representative failure: {metrics['representative_failure']}")
+
+
+async def run_live_api_probe() -> dict[str, Any] | None:
+    if not API_KEY:
+        print("Skipping live API probe: OPENAI_API_KEY/API_KEY is not set.")
+        return None
+    if not MODEL_NAME:
+        print("Skipping live API probe: OPENAI_MODEL/MODEL_NAME is not set.")
+        return None
+
+    client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
+    env = await make_env()
 
     metrics = {
-        "episodes": len(SEED_BANK),
+        "episodes": NUM_EPISODES,
+        "episode_successes": 0,
         "proposer_attempts": 0,
         "solver_attempts": 0,
-        "proposer_successes": 0,
-        "solver_successes": 0,
-        "proposer_step1_successes": 0,
-        "proposer_late_successes": 0,
-        "proposer_valid_bug_attempts": 0,
-        "proposer_unchanged_attempts": 0,
-        "proposer_changed_but_passing_attempts": 0,
         "proposer_syntax_errors": 0,
         "solver_syntax_errors": 0,
-        "proposer_rewards": [],
-        "solver_rewards": [],
-        "proposer_bug_family_attempts": {},
-        "episode_details": [],
+        "rewards": [],
+        "total_steps": 0,
         "representative_success": None,
         "representative_failure": None,
     }
@@ -144,224 +243,104 @@ async def run_live_api_probe(bug_bank) -> dict[str, object] | None:
     print("=" * 80)
     print("Live API probe")
     print("=" * 80)
-    print(f"API base URL: {base_url}")
-    print(f"Model: {model_name}")
+    print(f"API base URL: {API_BASE_URL}")
+    print(f"Model: {MODEL_NAME}")
+    print(f"Env URL: {ENV_URL}")
 
     try:
-        for episode in range(len(SEED_BANK)):
-            result = await env.reset()
-            obs = result.observation
-            seed_id = obs.metadata.get("seed_id", SEED_BANK[episode].seed_id)
-            original_code = obs.metadata.get("original_code", get_seed_by_id(seed_id).original_code)
+        for episode in range(1, NUM_EPISODES + 1):
+            result = await call_env_method(env, "reset")
+            obs = getattr(result, "observation", None)
+            done = bool(getattr(result, "done", False))
+            history: list[str] = []
+            success = False
 
-            print(f"\nEpisode {episode + 1}/{len(SEED_BANK)} | seed={seed_id}")
+            seed_id = "unknown"
+            if obs is not None:
+                metadata = getattr(obs, "metadata", {}) or {}
+                seed_id = metadata.get("seed_id", "unknown")
 
-            proposer_succeeded = False
-            for proposer_step in range(1, 5):
-                metrics["proposer_attempts"] += 1
-                proposer_prompt = sample_proposer_prompt(obs.current_code)
-                if proposer_feedback:
-                    proposer_prompt = f"{proposer_feedback}\n\n{proposer_prompt}"
+            print(f"\nEpisode {episode}/{NUM_EPISODES} | seed={seed_id}")
 
-                response = client.chat.completions.create(
-                    model=model_name,
-                    max_tokens=1024,
-                    temperature=0.7,
-                    messages=[
-                        {"role": "system", "content": "You are an expert Python coder."},
-                        {"role": "user", "content": proposer_prompt},
-                    ],
-                )
-                proposer_code = extract_python_code(response.choices[0].message.content or "")
-                result = await env.step(DebugzeroAction(role="proposer", code=proposer_code))
-                obs = result.observation
-                proposer_attempt = classify_proposer_attempt(
-                    original_code,
-                    proposer_code,
-                    tests_passed=obs.tests_passed,
-                    syntax_error=obs.syntax_error,
-                )
+            for step in range(1, MAX_STEPS + 1):
+                if done or obs is None:
+                    break
 
-                proposer_meta = {
-                    "seed_id": seed_id,
-                    "tests_passed": obs.tests_passed,
-                    "syntax_error": obs.syntax_error,
-                    "unsafe_code": obs.execution_result.startswith("Unsafe import detected."),
-                    "unchanged_code": proposer_attempt["unchanged_code"],
-                    "changed_but_passing": proposer_attempt["changed_but_passing"],
-                    "plausibility_score": 0.0
-                    if obs.syntax_error
-                    else compute_ast_distance(original_code, proposer_code),
-                }
-                proposer_reward = compute_proposer_reward(proposer_meta)
-                metrics["proposer_rewards"].append(proposer_reward)
-                likely_bug_family = infer_bug_operator(original_code, proposer_code) or "unknown"
-                if proposer_attempt["valid_bug"]:
-                    metrics["proposer_valid_bug_attempts"] += 1
-                    metrics["proposer_bug_family_attempts"][likely_bug_family] = (
-                        metrics["proposer_bug_family_attempts"].get(likely_bug_family, 0) + 1
-                    )
-                if proposer_attempt["unchanged_code"]:
-                    metrics["proposer_unchanged_attempts"] += 1
-                if proposer_attempt["changed_but_passing"]:
-                    metrics["proposer_changed_but_passing_attempts"] += 1
+                obs_dict = obs.model_dump() if hasattr(obs, "model_dump") else obs.dict()
+                role = str(obs_dict.get("role_next", "proposer"))
+                if role == "proposer":
+                    metrics["proposer_attempts"] += 1
+                else:
+                    metrics["solver_attempts"] += 1
 
-                if obs.syntax_error:
-                    metrics["proposer_syntax_errors"] += 1
-                    proposer_feedback = "Your last attempt caused a syntax error. Keep the code valid and preserve the signature."
-                elif proposer_attempt["valid_bug"]:
-                    proposer_feedback = "You created a valid failing bug. Keep the change small and realistic."
-                    proposer_succeeded = True
-                    metrics["proposer_successes"] += 1
-                    if proposer_step == 1:
-                        metrics["proposer_step1_successes"] += 1
+                try:
+                    code = await asyncio.to_thread(get_model_code, client, obs_dict, history)
+                except Exception as exc:
+                    print(f"[SYSTEM ERROR] Model generation failed: {exc}", file=sys.stderr, flush=True)
+                    code = str(obs_dict.get("current_code", ""))
+
+                action = DebugzeroAction(role=role, code=code)
+                action_str = compact_action_string(role, code)
+                result = await call_env_method(env, "step", action)
+                obs = getattr(result, "observation", None)
+                done = bool(getattr(result, "done", False))
+                reward = float(getattr(result, "reward", 0.0) or 0.0)
+                error = extract_env_error(result)
+
+                metrics["rewards"].append(reward)
+                metrics["total_steps"] += 1
+
+                if obs is not None and getattr(obs, "syntax_error", False):
+                    if role == "proposer":
+                        metrics["proposer_syntax_errors"] += 1
                     else:
-                        metrics["proposer_late_successes"] += 1
-                    metrics["episode_details"].append(
-                        {
-                            "seed_id": seed_id,
-                            "role": "proposer",
-                            "step": proposer_step,
-                            "likely_bug_family": likely_bug_family,
-                            "reward": proposer_reward,
-                        }
-                    )
-                    if metrics["representative_success"] is None:
-                        metrics["representative_success"] = {
-                            "role": "proposer",
-                            "seed_id": seed_id,
-                            "reward": proposer_reward,
-                            "code": proposer_code,
-                        }
-                    print(f"  proposer succeeded on step {proposer_step} with reward {proposer_reward:.2f}")
-                    break
-                elif proposer_attempt["unchanged_code"]:
-                    proposer_feedback = (
-                        "Your last attempt did not change behavior. Make exactly one small boundary, "
-                        "comparison, condition, or slice bug."
-                    )
-                else:
-                    proposer_feedback = (
-                        "The tests still passed. Keep exactly one small local edit, but make it "
-                        "behavior-changing."
-                    )
+                        metrics["solver_syntax_errors"] += 1
 
-            if not proposer_succeeded:
-                metrics["solver_rewards"].append(0.0)
-                if metrics["representative_failure"] is None:
-                    metrics["representative_failure"] = {
-                        "role": "proposer",
-                        "seed_id": seed_id,
-                        "reason": "failed_to_break_tests",
-                    }
-                print("  proposer did not create a failing bug; solver skipped.")
-                continue
-
-            for solver_step in range(1, 5):
-                metrics["solver_attempts"] += 1
-                solver_prompt = sample_solver_prompt(
-                    obs.current_code,
-                    obs.execution_result,
-                    mode="concise",
+                print(
+                    f"  step={step} role={role} reward={reward:.2f} done={str(done).lower()} error={error or 'null'}",
+                    flush=True,
                 )
-                if solver_feedback:
-                    solver_prompt = f"{solver_feedback}\n\n{solver_prompt}"
+                history.append(f"Step {step}: {action_str} -> reward {reward:.2f}")
 
-                response = client.chat.completions.create(
-                    model=model_name,
-                    max_tokens=1024,
-                    temperature=0.2,
-                    messages=[
-                        {"role": "system", "content": "You are an expert Python coder."},
-                        {"role": "user", "content": solver_prompt},
-                    ],
-                )
-                solver_code = extract_python_code(response.choices[0].message.content or "")
-                result = await env.step(DebugzeroAction(role="solver", code=solver_code))
-                obs = result.observation
-
-                solver_meta = {
-                    "seed_id": seed_id,
-                    "tests_passed": obs.tests_passed,
-                    "syntax_error": obs.syntax_error,
-                    "unsafe_code": obs.execution_result.startswith("Unsafe import detected."),
-                }
-                solver_reward = compute_solver_reward(solver_meta)
-                metrics["solver_rewards"].append(solver_reward)
-
-                if obs.syntax_error:
-                    metrics["solver_syntax_errors"] += 1
-                    solver_feedback = "The fix caused a syntax error. Return a valid full function."
-                elif obs.tests_passed:
-                    solver_feedback = "The fix passed the tests."
-                    metrics["solver_successes"] += 1
-                    if metrics["representative_success"] is None:
-                        metrics["representative_success"] = {
-                            "role": "solver",
-                            "seed_id": seed_id,
-                            "reward": solver_reward,
-                            "code": solver_code,
-                        }
-                    print(f"  solver succeeded on step {solver_step} with reward {solver_reward:.2f}")
-                    break
-                else:
-                    solver_feedback = "The bug is still present. Focus on the failing behavior in the traceback."
-                    if metrics["representative_failure"] is None:
+                if done and obs is not None:
+                    success = bool(getattr(obs, "tests_passed", False)) and not bool(
+                        getattr(obs, "syntax_error", False)
+                    )
+                    if success:
+                        metrics["episode_successes"] += 1
+                        if metrics["representative_success"] is None:
+                            metrics["representative_success"] = {
+                                "seed_id": getattr(obs, "metadata", {}).get("seed_id", "unknown"),
+                                "steps": step,
+                                "reward": reward,
+                            }
+                    elif metrics["representative_failure"] is None:
                         metrics["representative_failure"] = {
-                            "role": "solver",
-                            "seed_id": seed_id,
-                            "reason": "tests_still_failing",
-                            "execution_result": obs.execution_result,
+                            "seed_id": getattr(obs, "metadata", {}).get("seed_id", "unknown"),
+                            "steps": step,
+                            "execution_result": getattr(obs, "execution_result", ""),
                         }
+                    break
+
+            if not success and metrics["representative_failure"] is None:
+                failure_seed = seed_id
+                failure_output = getattr(obs, "execution_result", "") if obs is not None else ""
+                metrics["representative_failure"] = {
+                    "seed_id": failure_seed,
+                    "steps": min(MAX_STEPS, len(history)),
+                    "execution_result": failure_output,
+                }
 
         return metrics
     finally:
-        await env.close()
-
-
-def print_live_summary(metrics: dict[str, object]) -> None:
-    episodes = int(metrics["episodes"]) or 1
-    proposer_attempts = int(metrics["proposer_attempts"]) or 1
-    solver_attempts = int(metrics["solver_attempts"]) or 1
-    proposer_rewards = metrics["proposer_rewards"]
-    solver_rewards = metrics["solver_rewards"]
-
-    print("\n" + "=" * 80)
-    print("Live API summary")
-    print("=" * 80)
-    print(f"Proposer success rate: {metrics['proposer_successes'] / episodes:.2%}")
-    print(f"Solver success rate:   {metrics['solver_successes'] / episodes:.2%}")
-    print(f"Proposer step-1 success rate: {metrics['proposer_step1_successes'] / episodes:.2%}")
-    print(f"Proposer late success rate:   {metrics['proposer_late_successes'] / episodes:.2%}")
-    print(f"Proposer valid bug rate: {metrics['proposer_valid_bug_attempts'] / proposer_attempts:.2%}")
-    print(f"Proposer unchanged rate: {metrics['proposer_unchanged_attempts'] / proposer_attempts:.2%}")
-    print(
-        f"Proposer changed-pass rate: "
-        f"{metrics['proposer_changed_but_passing_attempts'] / proposer_attempts:.2%}"
-    )
-    print(f"Proposer syntax rate:  {metrics['proposer_syntax_errors'] / proposer_attempts:.2%}")
-    print(f"Solver syntax rate:    {metrics['solver_syntax_errors'] / solver_attempts:.2%}")
-    print(
-        f"Average proposer reward: "
-        f"{(sum(proposer_rewards) / len(proposer_rewards)) if proposer_rewards else 0.0:.2f}"
-    )
-    print(
-        f"Average solver reward:   "
-        f"{(sum(solver_rewards) / len(solver_rewards)) if solver_rewards else 0.0:.2f}"
-    )
-    print(f"Proposer bug families:  {metrics['proposer_bug_family_attempts']}")
-    print(f"Representative success: {metrics['representative_success']}")
-    print(f"Representative failure: {metrics['representative_failure']}")
+        await call_env_method(env, "close")
 
 
 async def main() -> None:
-    control_summary = run_deterministic_controls()
-    metrics = await run_live_api_probe(control_summary["bug_bank"])
+    metrics = await run_live_api_probe()
     if metrics is not None:
         print_live_summary(metrics)
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())
