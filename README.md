@@ -769,9 +769,8 @@ docker run -p 8000:8000 debugzero
 
 > [!IMPORTANT]  
 > **Final Submission Assets**
-> - **Mini-Blog / Writeup**: [📌 INSERT BLOG LINK HERE]
-> - **Demonstration Video**: [🎬 INSERT YOUTUBE LINK HERE]
-> - **Training Notebook**: [📓 train_colab_upate_1.ipynb](./MAIN_TRAINING_NOTEBOOK/train_colab_upate_1.ipynb)
+> - **Mini-Blog / Writeup**: [LINK TO BLOG](Blog.md)
+> - **Training Notebook**: [Training notebook](MAIN_TRAINING_NOTEBOOK/train_colab_updated_1.ipynb)
 
 ---
 

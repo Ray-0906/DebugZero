@@ -4,65 +4,58 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Multi-stage build using openenv-base
-# This Dockerfile is flexible and works for both:
-# - In-repo environments (with local OpenEnv sources)
-# - Standalone environments (with openenv from PyPI/Git)
-# The build script (openenv build) handles context detection and sets appropriate build args.
+# Multi-stage build tuned for both local docker validation and Hugging Face
+# Docker Spaces. The app itself still serves OpenEnv on port 8000, but the
+# container exposes the Space-facing port 7860 and forwards traffic there.
 
-ARG BASE_IMAGE=ghcr.io/meta-pytorch/openenv-base:latest
-FROM ${BASE_IMAGE} AS builder
+FROM python:3.10-slim AS builder
 
+ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
-# Ensure git is available (required for installing dependencies from VCS)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git && \
+    apt-get install -y --no-install-recommends curl ca-certificates git && \
+    curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    mv /root/.local/bin/uv /usr/local/bin/uv && \
+    mv /root/.local/bin/uvx /usr/local/bin/uvx && \
     rm -rf /var/lib/apt/lists/*
 
-# Build argument to control whether we're building standalone or in-repo
-ARG BUILD_MODE=in-repo
-ARG ENV_NAME=debugZero
-
-# Install the server runtime dependencies separately so the image doesn't
-# pull the full training stack from the repo root project.
+# Install only the server/runtime dependencies so the deployment image stays
+# lean and does not pull the full training stack.
 COPY server/requirements.txt /app/server-requirements.txt
 
-# Ensure uv is available (for local builds where base image lacks it)
-RUN if ! command -v uv >/dev/null 2>&1; then \
-        curl -LsSf https://astral.sh/uv/install.sh | sh && \
-        mv /root/.local/bin/uv /usr/local/bin/uv && \
-        mv /root/.local/bin/uvx /usr/local/bin/uvx; \
-    fi
-
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv venv /app/.venv && \
+RUN uv venv /app/.venv && \
     uv pip install --python /app/.venv/bin/python -r /app/server-requirements.txt
 
-# Copy environment code after dependency installation to preserve the cache
 COPY . /app/env
 
-# Final runtime stage
-FROM ${BASE_IMAGE}
-
-WORKDIR /app
-
-# Copy the virtual environment from builder
-COPY --from=builder /app/.venv /app/.venv
-
-# Copy the environment code
-COPY --from=builder /app/env /app/env
-
-# Set PATH to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"
-
-# Set PYTHONPATH so imports work correctly
 ENV PYTHONPATH="/app/env:$PYTHONPATH"
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+# Validate the environment during build so bad deploys fail early.
+RUN cd /app/env && openenv validate
 
-# Run the FastAPI server
-# The module path is constructed to work with the /app/env structure
-CMD ["sh", "-c", "cd /app/env && uvicorn server.app:app --host 0.0.0.0 --port 8000"]
+
+FROM python:3.10-slim
+
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends socat curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/env /app/env
+
+ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONPATH="/app/env:$PYTHONPATH"
+
+EXPOSE 7860
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://127.0.0.1:7860/health || exit 1
+
+# Hugging Face Docker Spaces expects the public app port to be the README
+# `app_port` (7860 here). OpenEnv itself stays on 8000 internally.
+CMD ["sh", "-c", "SPACE_PORT=${PORT:-7860}; cd /app/env && socat TCP-LISTEN:${SPACE_PORT},fork,reuseaddr TCP:127.0.0.1:8000 & exec uvicorn server.app:app --host 0.0.0.0 --port 8000"]
